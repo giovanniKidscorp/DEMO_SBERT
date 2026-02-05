@@ -4,41 +4,40 @@ import json
 import pickle
 import psycopg2
 import pandas as pd
-import numpy as np
-from sentence_transformers import SentenceTransformer, util
+from sentence_transformers import SentenceTransformer, util, CrossEncoder # <--- Nuevo Import
 from dotenv import load_dotenv
-
-# Cargar variables de entorno si existen (.env)
+import numpy as np
+# Cargar variables de entorno
 load_dotenv()
 
 class RecommendationEngine:
-    def __init__(self, model_name='paraphrase-multilingual-MiniLM-L12-v2', cache_dir="cache"):
+    def __init__(self, 
+                 bi_model_name='paraphrase-multilingual-MiniLM-L12-v2', 
+                 cross_model_name='cross-encoder/mmarco-mMiniLMv2-L12-H384-v1', # <--- Modelo Juez
+                 cache_dir="cache"):
         """
-        Inicializa el motor de recomendación.
-        :param model_name: Nombre del modelo de HuggingFace.
-        :param cache_dir: Carpeta donde se guardarán los archivos .pkl de embeddings.
+        Inicializa el motor híbrido (Buscador Rápido + Juez Preciso).
         """
-        print(f"🧠 Cargando modelo IA: {model_name}...")
-        self.model = SentenceTransformer(model_name)
-        self.df = pd.DataFrame() # DataFrame activo
-        self.embeddings = None   # Tensores activos
-        self.source_name = ""    # Nombre para identificar el caché
+        print(f"🧠 Cargando Bi-Encoder (Buscador): {bi_model_name}...")
+        self.bi_encoder = SentenceTransformer(bi_model_name)
         
-        # Crear carpeta de caché si no existe
+        print(f"⚖️ Cargando Cross-Encoder (Juez): {cross_model_name}...")
+        self.cross_encoder = CrossEncoder(cross_model_name)
+        
+        self.df = pd.DataFrame()
+        self.embeddings = None
+        self.source_name = ""
+        
         if not os.path.exists(cache_dir):
             os.makedirs(cache_dir)
         self.cache_dir = cache_dir
 
     def load_from_postgres(self, db_config=None, limit=10000):
-        """
-        Carga datos de canales desde AWS RDS PostgreSQL.
-        """
         self.source_name = "youtube_channels_db"
         print("🔌 Conectando a PostgreSQL...")
         
         conn = None
         try:
-            # Usa config pasada por argumento o busca en variables de entorno
             host = db_config.get('host') if db_config else os.getenv("DB_HOST")
             database = db_config.get('database') if db_config else os.getenv("DB_NAME")
             user = db_config.get('user') if db_config else os.getenv("DB_USER")
@@ -49,8 +48,9 @@ class RecommendationEngine:
                 port="5432", sslmode="require"
             )
             
+            # Traemos customurl y keywords para el contexto
             query = f"""
-                SELECT channel_title, channel_description, channel_bs_ch_keywords 
+                SELECT channel_title, channel_description, channel_customurl, channel_bs_ch_keywords 
                 FROM ods.tbl_canales 
                 LIMIT {limit};
             """
@@ -58,7 +58,7 @@ class RecommendationEngine:
             self.df = pd.read_sql_query(query, conn)
             self.df.fillna('', inplace=True)
             
-            # Crear Texto Rico (Feature Engineering)
+            # Texto rico para la IA (Bi-Encoder)
             self.df['texto_ia'] = (
                 "Canal: " + self.df['channel_title'] + ". " +
                 "Descripción: " + self.df['channel_description'] + ". " +
@@ -66,7 +66,7 @@ class RecommendationEngine:
             )
             
             print(f"✅ {len(self.df)} canales cargados desde DB.")
-            self._manage_embeddings() # Calcular o Cargar Vectores
+            self._manage_embeddings()
             
         except Exception as e:
             print(f"❌ Error SQL: {e}")
@@ -74,9 +74,6 @@ class RecommendationEngine:
             if conn: conn.close()
 
     def load_from_json(self, json_path):
-        """
-        Carga datos de Apps desde un archivo JSON (scraped data).
-        """
         self.source_name = os.path.basename(json_path).replace('.json', '')
         print(f"📂 Cargando JSON: {json_path}...")
         
@@ -87,25 +84,22 @@ class RecommendationEngine:
             self.df = pd.DataFrame(data)
             self.df.fillna('', inplace=True)
             
-            # Lógica específica para Apps (basada en tu notebook)
-            # Prioriza descripción larga, si es muy corta usa la resumen
+            # Lógica de descripción
             self.df['desc_final'] = self.df.apply(
                 lambda row: row.get('desc_larga', '') if len(str(row.get('desc_larga', ''))) > 10 else row.get('desc_corta', ''), 
                 axis=1
             )
             
-            # Normalización de nombres de columnas para que el buscador funcione genérico
-            # Si el json tiene 'titulo_store', lo copiamos a una columna común 'title'
             col_titulo = 'titulo_store' if 'titulo_store' in self.df.columns else 'titulo'
             self.df['common_title'] = self.df[col_titulo]
             
+            # Texto rico para la IA
             self.df['texto_ia'] = (
                 "App: " + self.df['common_title'].astype(str) + ". " +
                 "Género: " + self.df.get('genero', '').astype(str) + ". " +
                 "Descripción: " + self.df['desc_final'].astype(str)
             )
             
-            # Filtro básico de calidad (eliminar vacíos)
             self.df = self.df[self.df['texto_ia'].str.len() > 20].reset_index(drop=True)
             
             print(f"✅ {len(self.df)} apps cargadas.")
@@ -115,93 +109,113 @@ class RecommendationEngine:
             print(f"❌ Error JSON: {e}")
 
     def _manage_embeddings(self):
-        """
-        Maneja la caché de embeddings para no gastar CPU innecesariamente.
-        """
+        """Gestiona la caché de vectores del Bi-Encoder"""
         cache_file = os.path.join(self.cache_dir, f"{self.source_name}_embeddings.pkl")
         
-        # 1. Intentar cargar
         if os.path.exists(cache_file):
             print(f"💾 Cargando caché: {cache_file}...")
             with open(cache_file, 'rb') as f:
                 cached_data = pickle.load(f)
-                
-            # Verificación simple de integridad (mismo tamaño)
             if len(cached_data) == len(self.df):
                 self.embeddings = cached_data
                 print("✅ Embeddings listos.")
                 return
 
-        # 2. Generar si no existe
-        print("⚡ Generando nuevos embeddings (esto puede tardar)...")
+        print("⚡ Generando nuevos embeddings (Bi-Encoder)...")
         start = time.time()
-        self.embeddings = self.model.encode(
+        self.embeddings = self.bi_encoder.encode(
             self.df['texto_ia'].tolist(), 
             convert_to_tensor=True,
             show_progress_bar=True
         )
         print(f"⏱️ Tiempo: {time.time() - start:.2f}s")
         
-        # 3. Guardar
         with open(cache_file, 'wb') as f:
             pickle.dump(self.embeddings, f)
-        print("💾 Embeddings guardados en disco.")
 
     def search(self, query, negative_query=None, top_k=5, filters=None):
         """
-        Realiza la búsqueda semántica.
-        :param query: Texto positivo (lo que buscas).
-        :param negative_query: Texto negativo (lo que quieres evitar).
-        :param top_k: Cantidad de resultados.
-        :param filters: Dict con filtros duros {'genero': 'Action', 'score_min': 4.0}.
+        Búsqueda en dos etapas:
+        1. Retrieval (Bi-Encoder): Busca muchos candidatos (Rápido).
+        2. Re-Ranking (Cross-Encoder): Re-ordena con precisión (Lento pero exacto).
         """
         if self.embeddings is None:
-            print("⚠️ No hay datos cargados. Usa load_from_postgres o load_from_json primero.")
             return []
 
-        print(f"\n🔎 Buscando: '{query}' {f'(⛔ NO: {negative_query})' if negative_query else ''}")
+        # --- ETAPA 1: RETRIEVAL (La red amplia) ---
+        # Pedimos más candidatos de los necesarios (ej: 50) para que el Re-Ranker tenga de donde elegir
         
-        # 1. Vectorizar Query Positiva
-        query_vec = self.model.encode(query, convert_to_tensor=True)
+        # 1.1 Vectorizar Query
+        query_vec = self.bi_encoder.encode(query, convert_to_tensor=True)
         
-        # 2. Aritmética Vectorial (Negativa)
+        # 1.2 Lógica Negativa (Solo aplica al Bi-Encoder)
         if negative_query:
-            neg_vec = self.model.encode(negative_query, convert_to_tensor=True)
-            # Restamos el vector negativo (el 0.5 es un factor de suavizado)
+            neg_vec = self.bi_encoder.encode(negative_query, convert_to_tensor=True)
             query_vec = query_vec - (neg_vec * 0.5)
 
-        # 3. Búsqueda Semántica
-        hits = util.semantic_search(query_vec, self.embeddings, top_k=top_k * 2) # Pedimos el doble para filtrar después
+        # 1.3 Búsqueda Vectorial
+        hits = util.semantic_search(query_vec, self.embeddings, top_k)
         
-        results = []
+        # --- ETAPA 2: FILTRADO Y PREPARACIÓN PARA RE-RANKER ---
+        pares_para_reranker = [] # Lista de pares [Query, Texto]
+        indices_validos = []     # Índices originales en el DataFrame
+        
         for hit in hits[0]:
             idx = hit['corpus_id']
             row = self.df.iloc[idx]
-            score = hit['score']
             
-            # --- FILTROS DUROS (Hard Filters) ---
+            # Aplicamos Hard Filters ANTES del Re-Ranker para no gastar CPU en lo que no sirve
             if filters:
-                # Ejemplo filtro género
                 if 'genero' in filters and filters['genero']:
                     if filters['genero'].lower() not in str(row.get('genero', '')).lower():
                         continue
-                # Ejemplo filtro score
                 if 'score_min' in filters:
-                    if float(row.get('score', 0) or 0) < filters['score_min']:
+                    try:
+                        val = float(row.get('score', 0))
+                    except: val = 0
+                    if val < filters['score_min']:
                         continue
 
-            # Selección de título según el origen (DB o JSON)
+            # Si pasó los filtros, lo preparamos para el juez
+            texto_documento = row['texto_ia']
+            pares_para_reranker.append([query, texto_documento])
+            indices_validos.append(idx)
+
+        # Si no quedó nada después de filtrar, retornamos vacío
+        if not pares_para_reranker:
+            return []
+
+        # --- ETAPA 3: RE-RANKING (El Juez) ---
+        # El Cross-Encoder predice un score para cada par (Query, Documento)
+        # Esto soluciona lo de "AS" vs "Asbri" porque analiza la relación real
+        cross_scores = self.cross_encoder.predict(pares_para_reranker)
+        def sigmoid(x):
+            return 1 / (1 + np.exp(-x))
+        
+        cross_scores_probs = sigmoid(cross_scores)
+
+        # --- ETAPA 4: ORDENAMIENTO FINAL ---
+        resultados_finales = []
+        for i, score in enumerate(cross_scores_probs):
+            idx_original = indices_validos[i]
+            row = self.df.iloc[idx_original]
+            
+            # Usamos el score del Cross-Encoder, que es más confiable
+            # Normalmente viene en logits, a veces conviene normalizarlo con sigmoid, 
+            # pero para ordenar sirve tal cual.
+            
             title = row.get('channel_title') or row.get('common_title') or "Sin Título"
             desc = row.get('channel_description') or row.get('desc_final') or ""
             
-            results.append({
-                "score": round(score, 3),
+            resultados_finales.append({
+                "score": float(score), # Score del Cross-Encoder
                 "titulo": title,
-                "descripcion": desc[:150] + "...", # Preview
-                "metadata": row.to_dict() # Guardamos toda la info por si acaso
+                "descripcion": desc[:200] + "...",
+                "metadata": row.to_dict()
             })
-            
-            if len(results) >= top_k:
-                break
-                
-        return results
+
+        # Ordenamos de mayor a menor según el NUEVO score
+        resultados_finales = sorted(resultados_finales, key=lambda x: x['score'], reverse=True)
+        
+        # Devolvemos solo el top_k solicitado
+        return resultados_finales[:top_k]

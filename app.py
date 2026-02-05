@@ -9,7 +9,14 @@ st.set_page_config(
     page_icon="🚀",
     layout="wide"
 )
-
+MAPA_EDADES = {
+    "mp.audience.2.json": "👶 Preescolar (3-5 años)",
+    "mp.audience.3.json": "boy Niños (6-9 años)",
+    "mp.audience.4.json": "pre-teen Tweens (10-12 años)",
+    "mp.audience.5.json": "adolescent Teens (13-18 años)"
+}
+def formatear_nombre(nombre_archivo):
+    return MAPA_EDADES.get(nombre_archivo, nombre_archivo)
 # --- ESTILOS CSS ---
 st.markdown("""
 <style>
@@ -51,7 +58,7 @@ with st.sidebar:
         if os.path.exists(CARPETA_DATOS):
             archivos = [f for f in os.listdir(CARPETA_DATOS) if f.endswith('.json')]
             if archivos:
-                archivo_json = st.selectbox("Selecciona Audiencia:", archivos)
+                archivo_json = st.selectbox("Selecciona Audiencia:", archivos,format_func=formatear_nombre)
                 
                 if st.button("🔄 Cargar Dataset", type="primary"):
                     with st.spinner("Procesando..."):
@@ -61,7 +68,6 @@ with st.sidebar:
             else:
                 st.warning("Carpeta vacía.")
         
-        # --- AQUI ESTA LA MEJORA DE UI ---
         st.subheader("🛡️ 2. Filtros Activos")
         
         # Verificamos si hay datos cargados para leer los géneros
@@ -165,25 +171,76 @@ if query:
             meta = item['metadata']
             titulo = item['titulo']
             desc = item['descripcion']
-            
+            url_destino = "#"
+            texto_link = "placeholder"
             # Icono según score
             icono = "🔥" if score_ia > 0.55 else "✨"
-            
+            print(item['metadata'].get('channel_customurl'))
             # --- DISEÑO PARA APPS ---
+            # 1. Preparar datos según la fuente
+
             if fuente_seleccionada.startswith("📱"):
-                with st.expander(f"{icono} {titulo} (Similitud: {score_ia})", expanded=True):
-                    c1, c2, c3 = st.columns([1, 1, 4])
-                    with c1: st.metric("Score Store", f"⭐ {meta.get('score', 0)}")
-                    with c2: st.metric("Género", meta.get('genero', 'N/A'))
-                    with c3: st.markdown(f"**Descripción:** {desc}")
-            
-            # --- DISEÑO PARA YOUTUBE ---
+                # --- MODO APPS ---
+                es_app = True
+                # Link
+                app_id = item['metadata'].get('id') or item['metadata'].get('app_id')
+                url_destino = f"https://play.google.com/store/apps/details?id={app_id}" if app_id else "#"
+                texto_link = "📲 Play Store"
+                
+                # Datos Visuales
+                etiqueta_score = f"⭐ {meta.get('score', 'N/A')}"
+                etiqueta_centro = meta.get('genero', 'Sin género')
+                titulo_centro = "Género"
+                
             else:
-                with st.expander(f"📺 {titulo} (Similitud: {score_ia})", expanded=True):
-                    # YouTube no tiene score numérico ni género en tu tabla simple
-                    st.markdown(f"**Descripción del Canal:** {desc}")
+                # --- MODO YOUTUBE ---
+                es_app = False
+                # Link
+                custom_url = item['metadata'].get('channel_customurl')
+                if custom_url:
+                    if custom_url.startswith("http"):
+                        url_destino = custom_url
+                    else:
+                        url_destino = f"https://www.youtube.com/{custom_url}"
+                    texto_link = "📺 Ver Canal"
+                else:
+                    url_destino = "#"
+                    texto_link = "🚫 Sin Link"
                     
-                    # Mostramos keywords si existen
-                    kws = meta.get('channel_bs_ch_keywords', '')
-                    if kws:
-                        st.caption(f"🏷️ **Keywords:** {kws[:100]}...")
+                # Datos Visuales (Limpieza de estrellas)
+                etiqueta_score = "YouTube" # En vez de estrellas, ponemos un texto fijo
+                # En vez de género, mostramos las primeras keywords o "Canal"
+                kws = meta.get('channel_bs_ch_keywords', '')
+                etiqueta_centro = "Video / Canal"
+                titulo_centro = "Tipo"
+
+            # 2. RENDERIZADO VISUAL
+            # Usamos score_ia (similitud) para el título del expander
+            with st.expander(f"{icono} {titulo} (Similitud: {score_ia:.3f})", expanded=True):
+                
+                # Dividimos en columnas
+                c1, c2, c3 = st.columns([1, 1, 3])
+                
+                with c1:
+                    # COLUMNA IZQUIERDA: Score o Distintivo
+                    if es_app:
+                        st.metric("Score", etiqueta_score)
+                    else:
+                        # Para YouTube usamos un botón estático o badge, no un st.metric con números
+                        st.markdown(f"#### 📺 Canal")
+                    
+                    # Botón de Link (Común para ambos)
+                    if url_destino != "#":
+                        st.link_button(texto_link, url_destino)
+
+                with c2:
+                    # COLUMNA CENTRO: Género o Tipo
+                    st.metric(titulo_centro, etiqueta_centro)
+
+                with c3:
+                    # COLUMNA DERECHA: Descripción
+                    st.markdown(f"**Descripción:** {desc}")
+                    
+                    # Extra para YouTube: Mostrar Keywords abajo si existen
+                    if not es_app and kws:
+                        st.caption(f"🏷️ **Keywords:** {kws[:150]}...")
