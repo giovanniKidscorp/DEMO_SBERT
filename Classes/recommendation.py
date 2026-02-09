@@ -4,24 +4,28 @@ import json
 import pickle
 import psycopg2
 import pandas as pd
+import numpy as np
 from sentence_transformers import SentenceTransformer, util
+from rank_bm25 import BM25Okapi
 from dotenv import load_dotenv
 
 load_dotenv()
 
 class RecommendationEngine:
     def __init__(self, 
-                 model_name='intfloat/multilingual-e5-base', # <--- MODELO NUEVO (Más listo)
+                 model_name='intfloat/multilingual-e5-base',
                  cache_dir="cache"):
         """
-        Motor de búsqueda optimizado usando E5 (Instruct Model).
-        Es rápido (Bi-Encoder) pero preciso gracias al entrenamiento con instrucciones.
+        Motor de búsqueda híbrido usando E5 (semántico) + BM25 (léxico).
+        
+        COMPATIBLE CON TU INTERFAZ ACTUAL - Solo reemplaza el archivo en Classes/
         """
         print(f"🧠 Cargando Modelo E5: {model_name}...")
         self.model = SentenceTransformer(model_name)
         
         self.df = pd.DataFrame()
         self.embeddings = None
+        self.bm25 = None
         self.source_name = ""
         
         if not os.path.exists(cache_dir):
@@ -29,7 +33,8 @@ class RecommendationEngine:
         self.cache_dir = cache_dir
 
     def load_from_postgres(self, db_config=None, limit=10000):
-        self.source_name = "youtube_channels_db_e5" # Cambiamos nombre para no mezclar cache viejo
+        """Carga canales de YouTube desde PostgreSQL"""
+        self.source_name = "youtube_channels_db_hybrid"
         print("🔌 Conectando a PostgreSQL...")
         
         conn = None
@@ -53,12 +58,18 @@ class RecommendationEngine:
             self.df = pd.read_sql_query(query, conn)
             self.df.fillna('', inplace=True)
             
-            # --- TRUCO DE E5: Prefijo 'passage: ' ---
-            # Esto le dice al modelo que esto es contenido para ser buscado
+            # Texto para E5 (con prefijo 'passage:')
             self.df['texto_ia'] = "passage: " + (
                 "Canal: " + self.df['channel_title'] + ". " +
                 "Descripción: " + self.df['channel_description'] + ". " +
                 "Keywords: " + self.df['channel_bs_ch_keywords']
+            )
+            
+            # Texto para BM25 (sin prefijo, limpio)
+            self.df['texto_bm25'] = (
+                self.df['channel_title'] + " " +
+                self.df['channel_description'] + " " +
+                self.df['channel_bs_ch_keywords']
             )
             
             print(f"✅ {len(self.df)} canales cargados desde DB.")
@@ -67,10 +78,12 @@ class RecommendationEngine:
         except Exception as e:
             print(f"❌ Error SQL: {e}")
         finally:
-            if conn: conn.close()
+            if conn: 
+                conn.close()
 
     def load_from_json(self, json_path):
-        self.source_name = os.path.basename(json_path).replace('.json', '') + "_e5"
+        """Carga apps desde archivo JSON"""
+        self.source_name = os.path.basename(json_path).replace('.json', '') + "_hybrid"
         print(f"📂 Cargando JSON: {json_path}...")
         
         try:
@@ -88,14 +101,21 @@ class RecommendationEngine:
             col_titulo = 'titulo_store' if 'titulo_store' in self.df.columns else 'titulo'
             self.df['common_title'] = self.df[col_titulo]
             
-            # --- TRUCO DE E5: Prefijo 'passage: ' ---
+            # Texto para E5 (con prefijo 'passage:')
             self.df['texto_ia'] = "passage: " + (
                 "App: " + self.df['common_title'].astype(str) + ". " +
                 "Género: " + self.df.get('genero', '').astype(str) + ". " +
                 "Descripción: " + self.df['desc_final'].astype(str)
             )
             
-            self.df = self.df[self.df['texto_ia'].str.len() > 25].reset_index(drop=True) # >25 por el prefijo
+            # Texto para BM25 (sin prefijo, limpio)
+            self.df['texto_bm25'] = (
+                self.df['common_title'].astype(str) + " " +
+                self.df.get('genero', '').astype(str) + " " +
+                self.df['desc_final'].astype(str)
+            )
+            
+            self.df = self.df[self.df['texto_ia'].str.len() > 25].reset_index(drop=True)
             
             print(f"✅ {len(self.df)} apps cargadas.")
             self._manage_embeddings()
@@ -104,78 +124,194 @@ class RecommendationEngine:
             print(f"❌ Error JSON: {e}")
 
     def _manage_embeddings(self):
+        """Genera o carga embeddings E5 + índice BM25"""
         cache_file = os.path.join(self.cache_dir, f"{self.source_name}_embeddings.pkl")
+        bm25_cache_file = os.path.join(self.cache_dir, f"{self.source_name}_bm25.pkl")
         
+        # === EMBEDDINGS E5 ===
         if os.path.exists(cache_file):
-            print(f"💾 Cargando caché: {cache_file}...")
+            print(f"💾 Cargando caché E5: {cache_file}...")
             with open(cache_file, 'rb') as f:
                 cached_data = pickle.load(f)
             if len(cached_data) == len(self.df):
                 self.embeddings = cached_data
-                print("✅ Embeddings listos.")
-                return
+                print("✅ Embeddings E5 listos.")
+            else:
+                print("⚠️ Caché inválido, regenerando...")
+                self._generate_embeddings(cache_file)
+        else:
+            self._generate_embeddings(cache_file)
+        
+        # === ÍNDICE BM25 ===
+        if os.path.exists(bm25_cache_file):
+            print(f"💾 Cargando caché BM25: {bm25_cache_file}...")
+            with open(bm25_cache_file, 'rb') as f:
+                self.bm25 = pickle.load(f)
+            print("✅ Índice BM25 listo.")
+        else:
+            self._generate_bm25_index(bm25_cache_file)
 
-        print("⚡ Generando nuevos embeddings con E5 (Bi-Encoder)...")
+    def _generate_embeddings(self, cache_file):
+        """Genera embeddings E5"""
+        print("⚡ Generando embeddings E5...")
         start = time.time()
         self.embeddings = self.model.encode(
             self.df['texto_ia'].tolist(), 
             convert_to_tensor=True,
             show_progress_bar=True,
-            normalize_embeddings=True # E5 funciona mejor con vectores normalizados
+            normalize_embeddings=True
         )
-        print(f"⏱️ Tiempo: {time.time() - start:.2f}s")
+        print(f"⏱️ Tiempo E5: {time.time() - start:.2f}s")
         
         with open(cache_file, 'wb') as f:
             pickle.dump(self.embeddings, f)
+        print(f"💾 Caché guardado: {cache_file}")
 
-    def search(self, query, negative_query=None, top_k=5, filters=None):
-        if self.embeddings is None:
+    def _generate_bm25_index(self, cache_file):
+        """Genera índice BM25"""
+        print("🔤 Creando índice BM25...")
+        start = time.time()
+        
+        # Tokenizar corpus (simple split por espacios)
+        tokenized_corpus = [doc.lower().split() for doc in self.df['texto_bm25'].tolist()]
+        self.bm25 = BM25Okapi(tokenized_corpus)
+        
+        print(f"⏱️ Tiempo BM25: {time.time() - start:.2f}s")
+        
+        with open(cache_file, 'wb') as f:
+            pickle.dump(self.bm25, f)
+        print(f"💾 Caché guardado: {cache_file}")
+
+    def search(self, 
+               query, 
+               negative_query=None, 
+               top_k=5, 
+               filters=None,
+               semantic_weight=0.7,
+               lexical_weight=0.3):
+        """
+        Búsqueda híbrida compatible con tu interfaz Streamlit.
+        
+        MISMA FIRMA QUE TU CÓDIGO ORIGINAL - No necesitas cambiar app.py
+        
+        Args:
+            query: Consulta de búsqueda
+            negative_query: Términos a penalizar (opcional)
+            top_k: Número de resultados
+            filters: Dict con 'genero', 'score_min', etc.
+            semantic_weight: Peso búsqueda semántica (0-1)
+            lexical_weight: Peso búsqueda léxica (0-1)
+        
+        Returns:
+            Lista de resultados con estructura:
+            {
+                'score': float,
+                'titulo': str,
+                'descripcion': str,
+                'metadata': dict
+            }
+        """
+        if self.embeddings is None or self.bm25 is None:
+            print("❌ Embeddings o BM25 no inicializados")
             return []
 
-        # --- TRUCO DE E5: Prefijo 'query: ' ---
-        # Esto separa semánticamente la búsqueda del documento
-        query_text = "query:" + query
+        # Normalizar pesos
+        total_weight = semantic_weight + lexical_weight
+        if abs(total_weight - 1.0) > 0.01:
+            semantic_weight = semantic_weight / total_weight
+            lexical_weight = lexical_weight / total_weight
+
+        # ==========================================
+        # BÚSQUEDA SEMÁNTICA (E5)
+        # ==========================================
+        query_text = "query: " + query
         query_vec = self.model.encode(query_text, convert_to_tensor=True, normalize_embeddings=True)
         
-        # Lógica Negativa
+        # Query negativa
         if negative_query:
-            neg_text = "query:" + negative_query
+            neg_text = "query: " + negative_query
             neg_vec = self.model.encode(neg_text, convert_to_tensor=True, normalize_embeddings=True)
-            query_vec = query_vec - (neg_vec * 0.6) # Factor suave
-
-        # Búsqueda Rápida (Coseno)
-        # Pedimos un poco más para tener margen de filtrado
-        hits = util.semantic_search(query_vec, self.embeddings, top_k=top_k * 5)
+            query_vec = query_vec - (neg_vec * 0.8)
         
-        results = []
-        for hit in hits[0]:
+        # Búsqueda semántica
+        semantic_hits = util.semantic_search(query_vec, self.embeddings, top_k=min(len(self.df), top_k * 20))
+        
+        # ==========================================
+        # BÚSQUEDA LÉXICA (BM25)
+        # ==========================================
+        tokenized_query = query.lower().split()
+        bm25_scores = self.bm25.get_scores(tokenized_query)
+        
+        # ==========================================
+        # FUSIÓN DE SCORES
+        # ==========================================
+        combined_scores = {}
+        
+        # Agregar scores semánticos
+        for hit in semantic_hits[0]:
             idx = hit['corpus_id']
-            row = self.df.iloc[idx]
-            score = hit['score']
+            combined_scores[idx] = float(hit['score']) * semantic_weight
+        
+        # Normalizar y agregar scores BM25
+        max_bm25 = max(bm25_scores) if max(bm25_scores) > 0 else 1.0
+        for idx, bm25_score in enumerate(bm25_scores):
+            normalized_bm25 = bm25_score / max_bm25
             
-            # FILTROS DUROS
+            if idx in combined_scores:
+                combined_scores[idx] += normalized_bm25 * lexical_weight
+            else:
+                combined_scores[idx] = normalized_bm25 * lexical_weight
+        
+        # Ordenar por score combinado
+        sorted_indices = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
+        
+        # ==========================================
+        # APLICAR FILTROS Y CONSTRUIR RESULTADOS
+        # ==========================================
+        results = []
+        for idx, combined_score in sorted_indices:
+            if len(results) >= top_k:
+                break
+            
+            row = self.df.iloc[idx]
+            
+            # === FILTROS DUROS ===
             if filters:
+                # Filtro por género
                 if 'genero' in filters and filters['genero']:
                     if filters['genero'].lower() not in str(row.get('genero', '')).lower():
                         continue
+                
+                # Filtro por score mínimo
                 if 'score_min' in filters:
                     try:
                         val = float(row.get('score', 0))
-                    except: val = 0
+                    except: 
+                        val = 0
                     if val < filters['score_min']:
                         continue
+                
+                # Filtro por keywords que DEBEN aparecer
+                if 'must_contain' in filters and filters['must_contain']:
+                    texto_completo = str(row.get('channel_title', '')) + " " + str(row.get('channel_description', ''))
+                    if filters['must_contain'].lower() not in texto_completo.lower():
+                        continue
+                
+                # Filtro por keywords que NO deben aparecer
+                if 'must_not_contain' in filters and filters['must_not_contain']:
+                    texto_completo = str(row.get('channel_title', '')) + " " + str(row.get('channel_description', ''))
+                    if filters['must_not_contain'].lower() in texto_completo.lower():
+                        continue
             
+            # === EXTRAER DATOS (Compatible con tu interfaz) ===
             title = row.get('channel_title') or row.get('common_title') or "Sin Título"
             desc = row.get('channel_description') or row.get('desc_final') or ""
             
             results.append({
-                "score": float(score),
+                "score": float(combined_score),
                 "titulo": title,
-                "descripcion": desc[:200] + "...",
+                "descripcion": desc[:200] + ("..." if len(desc) > 200 else ""),
                 "metadata": row.to_dict()
             })
-            
-            if len(results) >= top_k:
-                break
         
         return results

@@ -175,7 +175,6 @@ if query:
             texto_link = "placeholder"
             # Icono según score
             icono = "🔥" if score_ia > 0.55 else "✨"
-            print(item['metadata'].get('channel_customurl'))
             # --- DISEÑO PARA APPS ---
             # 1. Preparar datos según la fuente
 
