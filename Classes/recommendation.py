@@ -134,14 +134,14 @@ class RecommendationEngine:
 
         # --- TRUCO DE E5: Prefijo 'query: ' ---
         # Esto separa semánticamente la búsqueda del documento
-        query_text = "query: " + query
+        query_text = "query:" + query
         query_vec = self.model.encode(query_text, convert_to_tensor=True, normalize_embeddings=True)
         
         # Lógica Negativa
         if negative_query:
-            neg_text = "query: " + negative_query
+            neg_text = "query:" + negative_query
             neg_vec = self.model.encode(neg_text, convert_to_tensor=True, normalize_embeddings=True)
-            query_vec = query_vec - (neg_vec * 0.4) # Factor suave
+            query_vec = query_vec - (neg_vec * 0.6) # Factor suave
 
         # Búsqueda Rápida (Coseno)
         # Pedimos un poco más para tener margen de filtrado

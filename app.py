@@ -135,7 +135,7 @@ with col_neg:
     neg_query = st.text_input("⛔ Excluir concepto:", placeholder="Ej: violencia, anuncios")
 
 # Opciones avanzadas
-top_k = st.slider("Cantidad de resultados", 1, 1000, 5)
+top_k = st.slider("Cantidad de resultados", 1, 10000, 5)
 
 # --- LÓGICA DE EJECUCIÓN ---
 if query:
