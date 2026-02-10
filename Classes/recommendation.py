@@ -188,19 +188,26 @@ class RecommendationEngine:
                top_k=5, 
                filters=None,
                semantic_weight=0.7,
-               lexical_weight=0.3):
+               lexical_weight=0.3,
+               hard_negative_filter=True,
+               bm25_negative_penalty=0.7,
+               negative_boost_factor=1.15):
         """
         Búsqueda híbrida compatible con tu interfaz Streamlit.
         
         MISMA FIRMA QUE TU CÓDIGO ORIGINAL - No necesitas cambiar app.py
+        Los parámetros nuevos son opcionales con defaults inteligentes.
         
         Args:
             query: Consulta de búsqueda
-            negative_query: Términos a penalizar (opcional)
+            negative_query: Términos a penalizar/excluir (opcional)
             top_k: Número de resultados
             filters: Dict con 'genero', 'score_min', etc.
             semantic_weight: Peso búsqueda semántica (0-1)
             lexical_weight: Peso búsqueda léxica (0-1)
+            hard_negative_filter: Si True, EXCLUYE resultados con negative keywords (recomendado)
+            bm25_negative_penalty: Penalización BM25 para negative keywords (0-1, 0.7 = -70%)
+            negative_boost_factor: Boost para resultados SIN negative keywords (>1.0)
         
         Returns:
             Lista de resultados con estructura:
@@ -242,6 +249,25 @@ class RecommendationEngine:
         tokenized_query = query.lower().split()
         bm25_scores = self.bm25.get_scores(tokenized_query)
         
+        # Preparar negative keywords para filtrado/penalización
+        negative_keywords = set()
+        if negative_query:
+            negative_keywords = set(negative_query.lower().split())
+            
+            # Penalizar scores BM25 si contienen negative keywords
+            if bm25_negative_penalty > 0:
+                for idx in range(len(bm25_scores)):
+                    row = self.df.iloc[idx]
+                    texto = (
+                        str(row.get('channel_title', '')) + " " +
+                        str(row.get('common_title', '')) + " " +
+                        str(row.get('channel_description', '')) + " " +
+                        str(row.get('desc_final', ''))
+                    ).lower()
+                    
+                    if any(keyword in texto for keyword in negative_keywords):
+                        bm25_scores[idx] *= (1 - bm25_negative_penalty)
+        
         # ==========================================
         # FUSIÓN DE SCORES
         # ==========================================
@@ -252,7 +278,7 @@ class RecommendationEngine:
             idx = hit['corpus_id']
             combined_scores[idx] = float(hit['score']) * semantic_weight
         
-        # Normalizar y agregar scores BM25
+        # Normalizar y agregar scores BM25, REVISAR!!!
         max_bm25 = max(bm25_scores) if max(bm25_scores) > 0 else 1.0
         for idx, bm25_score in enumerate(bm25_scores):
             normalized_bm25 = bm25_score / max_bm25
@@ -269,11 +295,33 @@ class RecommendationEngine:
         # APLICAR FILTROS Y CONSTRUIR RESULTADOS
         # ==========================================
         results = []
+        excluded_count = 0
+        boosted_count = 0
+        
         for idx, combined_score in sorted_indices:
             if len(results) >= top_k:
                 break
             
             row = self.df.iloc[idx]
+            
+            # === FILTRO DURO DE NEGATIVE KEYWORDS ===
+            if hard_negative_filter and negative_keywords:
+                texto_completo = (
+                    str(row.get('channel_title', '')) + " " +
+                    str(row.get('common_title', '')) + " " +
+                    str(row.get('channel_description', '')) + " " +
+                    str(row.get('desc_final', ''))
+                ).lower()
+                
+                has_negative = any(keyword in texto_completo for keyword in negative_keywords)
+                
+                if has_negative:
+                    excluded_count += 1
+                    continue  # EXCLUIR COMPLETAMENTE
+                elif negative_boost_factor > 1.0:
+                    # Boost para resultados sin negative keywords
+                    combined_score *= negative_boost_factor
+                    boosted_count += 1
             
             # === FILTROS DUROS ===
             if filters:
