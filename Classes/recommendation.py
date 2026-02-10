@@ -191,7 +191,7 @@ class RecommendationEngine:
                lexical_weight=0.3,
                hard_negative_filter=True,
                bm25_negative_penalty=0.7,
-               negative_boost_factor=1.15):
+               negative_boost_factor=1):
         """
         Búsqueda híbrida compatible con tu interfaz Streamlit.
         
