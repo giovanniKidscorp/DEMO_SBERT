@@ -100,7 +100,7 @@ with st.sidebar:
         st.info("Conectando a AWS RDS (Kidscorp Youtube)")
         
         # Límite para no traerse millones de canales de golpe
-        limit_db = st.number_input("Límite de Canales a analizar", 1000, 50000, 10000, step=1000)
+        limit_db = st.number_input("Límite de Canales a analizar", 1000, 50000, 10000, step=1000,disabled=True)
         
         if st.button("🔄 Conectar y Descargar", type="primary"):
             with st.spinner("Conectando a Postgres y generando vectores..."):
