@@ -8,6 +8,18 @@ import numpy as np
 from sentence_transformers import SentenceTransformer, util
 from rank_bm25 import BM25Okapi
 from dotenv import load_dotenv
+import unicodedata
+
+def limpiar_texto(texto):
+    """Elimina tildes y convierte a minúsculas para comparaciones precisas."""
+    if not texto: return ""
+    texto = str(texto).lower()
+    # Eliminar acentos
+    texto = ''.join(
+        c for c in unicodedata.normalize('NFD', texto)
+        if unicodedata.category(c) != 'Mn'
+    )
+    return texto
 
 load_dotenv()
 
@@ -306,22 +318,27 @@ class RecommendationEngine:
             
             # === FILTRO DURO DE NEGATIVE KEYWORDS ===
             if hard_negative_filter and negative_keywords:
-                texto_completo = (
-                    str(row.get('channel_title', '')) + " " +
-                    str(row.get('common_title', '')) + " " +
-                    str(row.get('channel_description', '')) + " " +
-                    str(row.get('desc_final', ''))
-                ).lower()
+                # 1. Normalizamos las palabras negativas una sola vez (puedes sacarlo del loop por eficiencia)
+                neg_keywords_clean = [limpiar_texto(k) for k in negative_keywords]
                 
-                has_negative = any(keyword in texto_completo for keyword in negative_keywords)
+                # 2. Construimos un texto que incluya ABSOLUTAMENTE TODO
+                texto_para_filtrar = " ".join([
+                    str(row.get('channel_title', '')),
+                    str(row.get('common_title', '')),
+                    str(row.get('channel_description', '')),
+                    str(row.get('desc_final', '')),
+                    str(row.get('channel_bs_ch_keywords', '')), 
+                    str(row.get('genero', ''))                  
+                ])
+                
+                texto_limpio = limpiar_texto(texto_para_filtrar)
+                
+                # 3. Buscamos coincidencias
+                has_negative = any(keyword in texto_limpio for keyword in neg_keywords_clean)
                 
                 if has_negative:
                     excluded_count += 1
                     continue  # EXCLUIR COMPLETAMENTE
-                elif negative_boost_factor > 1.0:
-                    # Boost para resultados sin negative keywords
-                    combined_score *= negative_boost_factor
-                    boosted_count += 1
             
             # === FILTROS DUROS ===
             if filters:
