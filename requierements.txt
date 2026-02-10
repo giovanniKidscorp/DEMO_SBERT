@@ -1,0 +1,10 @@
+streamlit
+os
+time
+json
+pickle
+psycopg2
+pandas
+numpy
+sentence_transformers
+rank_bm25
