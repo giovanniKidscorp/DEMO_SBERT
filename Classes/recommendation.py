@@ -44,10 +44,14 @@ class RecommendationEngine:
             os.makedirs(cache_dir)
         self.cache_dir = cache_dir
 
-    def load_from_postgres(self, db_config=None, limit=10000):
+    def load_from_postgres(self, db_config=None, limit=10000, force_refresh=False):
         """Carga canales de YouTube desde PostgreSQL"""
         self.source_name = "youtube_channels_db_hybrid"
         print("🔌 Conectando a PostgreSQL...")
+        
+        # Clear cache if forced
+        if force_refresh:
+            self._clear_cache()
         
         conn = None
         try:
@@ -93,10 +97,14 @@ class RecommendationEngine:
             if conn: 
                 conn.close()
 
-    def load_from_json(self, json_path):
+    def load_from_json(self, json_path, force_refresh=False):
         """Carga apps desde archivo JSON"""
         self.source_name = os.path.basename(json_path).replace('.json', '') + "_hybrid"
         print(f"📂 Cargando JSON: {json_path}...")
+        
+        # Clear cache if forced
+        if force_refresh:
+            self._clear_cache()
         
         try:
             with open(json_path, 'r', encoding='utf-8') as f:
@@ -134,6 +142,19 @@ class RecommendationEngine:
             
         except Exception as e:
             print(f"❌ Error JSON: {e}")
+
+    def _clear_cache(self):
+        """Elimina caché existente para forzar regeneración"""
+        cache_patterns = [
+            f"{self.source_name}_embeddings.pkl",
+            f"{self.source_name}_bm25.pkl"
+        ]
+        
+        for pattern in cache_patterns:
+            cache_file = os.path.join(self.cache_dir, pattern)
+            if os.path.exists(cache_file):
+                os.remove(cache_file)
+                print(f"🗑️ Caché eliminado: {pattern}")
 
     def _manage_embeddings(self):
         """Genera o carga embeddings E5 + índice BM25"""
@@ -252,8 +273,15 @@ class RecommendationEngine:
             neg_vec = self.model.encode(neg_text, convert_to_tensor=True, normalize_embeddings=True)
             query_vec = query_vec - (neg_vec * 0.8)
         
-        # Búsqueda semántica
-        semantic_hits = util.semantic_search(query_vec, self.embeddings, top_k=min(len(self.df), top_k * 20))
+        # ESTRATEGIA OPTIMIZADA PARA RANKING CONSISTENTE:
+        # Traer suficientes candidatos para garantizar ranking global,
+        # pero sin procesar TODO el corpus (rendimiento)
+        # Fórmula: max(1000, top_k * 10, 10% del corpus)
+        candidate_size = max(1000, top_k * 10, int(len(self.df) * 0.1))
+        candidate_size = min(candidate_size, len(self.df))  # No exceder tamaño corpus
+        
+        # Búsqueda semántica con candidatos suficientes
+        semantic_hits = util.semantic_search(query_vec, self.embeddings, top_k=candidate_size)
         
         # ==========================================
         # BÚSQUEDA LÉXICA (BM25)
