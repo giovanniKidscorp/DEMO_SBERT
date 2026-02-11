@@ -10,10 +10,10 @@ st.set_page_config(
     layout="wide"
 )
 MAPA_EDADES = {
-    "mp.audience.2.json": "👶 Preescolar (3-5 años)",
-    "mp.audience.3.json": "boy Niños (6-9 años)",
-    "mp.audience.4.json": "pre-teen Tweens (10-12 años)",
-    "mp.audience.5.json": "adolescent Teens (13-18 años)"
+    "mp.audience.2.json": "Preescolar (3-5 años)",
+    "mp.audience.3.json": "Niños (6-9 años)",
+    "mp.audience.4.json": "Tweens (10-12 años)",
+    "mp.audience.5.json": "Teens (13-18 años)"
 }
 def formatear_nombre(nombre_archivo):
     return MAPA_EDADES.get(nombre_archivo, nombre_archivo)
