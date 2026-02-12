@@ -9,19 +9,61 @@ from sentence_transformers import SentenceTransformer, util
 from rank_bm25 import BM25Okapi
 from dotenv import load_dotenv
 import unicodedata
+import spacy
+from functools import lru_cache
+from lingua import Language, LanguageDetectorBuilder
 
-def limpiar_texto(texto):
-    """Elimina tildes y convierte a minúsculas para comparaciones precisas."""
-    if not texto: return ""
-    texto = str(texto).lower()
-    # Eliminar acentos
-    texto = ''.join(
-        c for c in unicodedata.normalize('NFD', texto)
-        if unicodedata.category(c) != 'Mn'
-    )
-    return texto
+# Construimos detector solo con los idiomas que nos interesan
+LANGUAGES = [Language.SPANISH, Language.ENGLISH, Language.PORTUGUESE]
+
+LANG_DETECTOR = LanguageDetectorBuilder.from_languages(*LANGUAGES).build()
+
+SUPPORTED_LANGS = {"es", "en", "pt"}
+
+NLP_MODELS = {
+    "es": spacy.load("es_core_news_sm"),
+    "en": spacy.load("en_core_web_sm"),
+    "pt": spacy.load("pt_core_news_sm")
+}
+
+def detect_language(text: str) -> str:
+    if not text or len(text) < 3:
+        return "es"
+
+    detected = LANG_DETECTOR.detect_language_of(text)
+
+    if detected == Language.SPANISH:
+        return "es"
+    elif detected == Language.ENGLISH:
+        return "en"
+    elif detected == Language.PORTUGUESE:
+        return "pt"
+
+    return "es"
+
 
 load_dotenv()
+
+@lru_cache(maxsize=10000)
+def normalize_text(text: str):
+        if not text:
+            return []
+
+        lang = detect_language(text)
+        nlp = NLP_MODELS[lang]
+
+        doc = nlp(text.lower())
+
+        tokens = [
+            token.lemma_
+            for token in doc
+            if not token.is_stop
+            and not token.is_punct
+            and not token.like_num
+            and len(token) > 2
+        ]
+
+        return tokens
 
 class RecommendationEngine:
     def __init__(self, 
@@ -43,6 +85,7 @@ class RecommendationEngine:
         if not os.path.exists(cache_dir):
             os.makedirs(cache_dir)
         self.cache_dir = cache_dir
+
 
     def load_from_postgres(self, db_config=None, limit=10000, force_refresh=False):
         """Carga canales de YouTube desde PostgreSQL"""
@@ -205,8 +248,11 @@ class RecommendationEngine:
         print("🔤 Creando índice BM25...")
         start = time.time()
         
-        # Tokenizar corpus (simple split por espacios)
-        tokenized_corpus = [doc.lower().split() for doc in self.df['texto_bm25'].tolist()]
+        # Tokenizar corpus 
+        tokenized_corpus = [
+            normalize_text(doc)
+            for doc in self.df['texto_bm25'].tolist()
+        ]
         self.bm25 = BM25Okapi(tokenized_corpus)
         
         print(f"⏱️ Tiempo BM25: {time.time() - start:.2f}s")
@@ -286,13 +332,14 @@ class RecommendationEngine:
         # ==========================================
         # BÚSQUEDA LÉXICA (BM25)
         # ==========================================
-        tokenized_query = query.lower().split()
+        tokenized_query = normalize_text(query)
+
         bm25_scores = self.bm25.get_scores(tokenized_query)
         
         # Preparar negative keywords para filtrado/penalización
         negative_keywords = set()
         if negative_query:
-            negative_keywords = set(negative_query.lower().split())
+            negative_keywords = set(normalize_text(negative_query))
             
             # Penalizar scores BM25 si contienen negative keywords
             if bm25_negative_penalty > 0:
@@ -346,8 +393,6 @@ class RecommendationEngine:
             
             # === FILTRO DURO DE NEGATIVE KEYWORDS ===
             if hard_negative_filter and negative_keywords:
-                # 1. Normalizamos las palabras negativas una sola vez (puedes sacarlo del loop por eficiencia)
-                neg_keywords_clean = [limpiar_texto(k) for k in negative_keywords]
                 
                 # 2. Construimos un texto que incluya ABSOLUTAMENTE TODO
                 texto_para_filtrar = " ".join([
@@ -359,10 +404,12 @@ class RecommendationEngine:
                     str(row.get('genero', ''))                  
                 ])
                 
-                texto_limpio = limpiar_texto(texto_para_filtrar)
+           
+                texto_normalizado = normalize_text(texto_para_filtrar)
                 
                 # 3. Buscamos coincidencias
-                has_negative = any(keyword in texto_limpio for keyword in neg_keywords_clean)
+                has_negative = any(keyword in texto_normalizado for keyword in negative_keywords)
+
                 
                 if has_negative:
                     excluded_count += 1
