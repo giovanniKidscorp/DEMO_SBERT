@@ -5,19 +5,17 @@ import pickle
 import psycopg2
 import pandas as pd
 import numpy as np
+import torch
 from sentence_transformers import SentenceTransformer, util
 from rank_bm25 import BM25Okapi
 from dotenv import load_dotenv
-import unicodedata
 import spacy
 from functools import lru_cache
 from lingua import Language, LanguageDetectorBuilder
 
 # Construimos detector solo con los idiomas que nos interesan
 LANGUAGES = [Language.SPANISH, Language.ENGLISH, Language.PORTUGUESE]
-
 LANG_DETECTOR = LanguageDetectorBuilder.from_languages(*LANGUAGES).build()
-
 SUPPORTED_LANGS = {"es", "en", "pt"}
 
 NLP_MODELS = {
@@ -29,237 +27,121 @@ NLP_MODELS = {
 def detect_language(text: str) -> str:
     if not text or len(text) < 3:
         return "es"
-
     detected = LANG_DETECTOR.detect_language_of(text)
-
-    if detected == Language.SPANISH:
-        return "es"
-    elif detected == Language.ENGLISH:
-        return "en"
-    elif detected == Language.PORTUGUESE:
-        return "pt"
-
+    if detected == Language.SPANISH: return "es"
+    elif detected == Language.ENGLISH: return "en"
+    elif detected == Language.PORTUGUESE: return "pt"
     return "es"
-
 
 load_dotenv()
 
 @lru_cache(maxsize=10000)
 def normalize_text(text: str):
-        if not text:
-            return []
-
-        lang = detect_language(text)
-        nlp = NLP_MODELS[lang]
-
-        doc = nlp(text.lower())
-
-        tokens = [
-            token.lemma_
-            for token in doc
-            if not token.is_stop
-            and not token.is_punct
-            and not token.like_num
-            and len(token) > 2
-        ]
-
-        return tokens
+    if not text:
+        return []
+    lang = detect_language(text)
+    nlp = NLP_MODELS[lang]
+    doc = nlp(text.lower())
+    tokens = [
+        token.lemma_
+        for token in doc
+        if not token.is_stop
+        and not token.is_punct
+        and not token.like_num
+        and len(token) > 2
+    ]
+    return tokens
 
 class RecommendationEngine:
-    def __init__(self, 
-                 model_name='intfloat/multilingual-e5-base',
-                 cache_dir="cache"):
+    def __init__(self, model_name='intfloat/multilingual-e5-base'):
         """
-        Motor de búsqueda híbrido usando E5 (semántico) + BM25 (léxico).
-        
-        COMPATIBLE CON TU INTERFAZ ACTUAL - Solo reemplaza el archivo en Classes/
+        Motor de búsqueda híbrido.
+        AHORA 100% CONECTADO A POSTGRES (Kidscorp Producto).
         """
-        print(f"🧠 Cargando Modelo E5: {model_name}...")
+        print(f"🧠 Cargando Modelo E5 (Solo para queries): {model_name}...")
         self.model = SentenceTransformer(model_name)
         
         self.df = pd.DataFrame()
         self.embeddings = None
         self.bm25 = None
         self.source_name = ""
-        
-        if not os.path.exists(cache_dir):
-            os.makedirs(cache_dir)
-        self.cache_dir = cache_dir
 
-
-    def load_from_postgres(self, db_config=None, limit=10000, force_refresh=False):
-        """Carga canales de YouTube desde PostgreSQL"""
-        self.source_name = "youtube_channels_db_hybrid"
-        print("🔌 Conectando a PostgreSQL...")
-        
-        # Clear cache if forced
-        if force_refresh:
-            self._clear_cache()
+    def _load_from_db(self, fuente):
+        """Descarga el BM25, los vectores E5 y la metadata desde Postgres"""
+        print(f"\n☁️ Conectando a Postgres para cargar: '{fuente}'")
+        start = time.time()
         
         conn = None
         try:
-            host = db_config.get('host') if db_config else os.getenv("DB_HOST")
-            database = db_config.get('database') if db_config else os.getenv("DB_NAME")
-            user = db_config.get('user') if db_config else os.getenv("DB_USER")
-            password = db_config.get('password') if db_config else os.getenv("DB_PASS")
-
+            # Nos conectamos SIEMPRE a la base de datos de Producto donde guardamos los vectores
             conn = psycopg2.connect(
-                host=host, database=database, user=user, password=password,
-                port="5432", sslmode="require"
+                host=os.getenv("DB_HOST"), 
+                database=os.getenv("DB_NAME"), # kidscorp_producto
+                user=os.getenv("DB_USER"), 
+                password=os.getenv("DB_PASS"),
+                port="5432", 
+                sslmode="require"
             )
+            cursor = conn.cursor()
             
-            query = f"""
-                SELECT channel_title, channel_description, channel_customurl, channel_bs_ch_keywords 
-                FROM ods.tbl_canales 
-                LIMIT {limit};
-            """
+            # 1. Cargar BM25
+            print("   📥 Descargando índice léxico (BM25)...")
+            cursor.execute("SELECT archivo_pickle FROM keywordsearch.archivos_bm25 WHERE fuente = %s", (fuente,))
+            row = cursor.fetchone()
+            if row:
+                self.bm25 = pickle.loads(row[0])
+                print("   ✅ BM25 cargado y listo en memoria.")
+            else:
+                print(f"   ❌ ERROR: No se encontró BM25 para '{fuente}' en la DB.")
+                
+            # 2. Cargar Vectores y Metadata
+            print("   📥 Descargando vectores semánticos (E5) y metadata...")
+            # IMPORTANTE: ORDER BY id ASC para que coincidan perfectamente con el índice interno del BM25
+            cursor.execute("""
+                SELECT metadata, embedding::text 
+                FROM keywordsearch.vectores_e5 
+                WHERE fuente = %s
+                ORDER BY id ASC
+            """, (fuente,))
+            rows = cursor.fetchall()
             
-            self.df = pd.read_sql_query(query, conn)
-            self.df.fillna('', inplace=True)
-            
-            # Texto para E5 (con prefijo 'passage:')
-            self.df['texto_ia'] = "passage: " + (
-                "Canal: " + self.df['channel_title'] + ". " +
-                "Descripción: " + self.df['channel_description'] + ". " +
-                "Keywords: " + self.df['channel_bs_ch_keywords']
-            )
-            
-            # Texto para BM25 (sin prefijo, limpio)
-            self.df['texto_bm25'] = (
-                self.df['channel_title'] + " " +
-                self.df['channel_description'] + " " +
-                self.df['channel_bs_ch_keywords']
-            )
-            
-            print(f"✅ {len(self.df)} canales cargados desde DB.")
-            self._manage_embeddings()
+            if rows:
+                df_records = []
+                tensor_list = []
+                
+                for meta, emb_str in rows:
+                    df_records.append(meta)
+                    # Convertimos el string de la DB "[0.1, 0.2...]" a una lista de Python
+                    tensor_list.append(json.loads(emb_str))
+                    
+                # Reconstruimos el DataFrame y el Tensor en memoria
+                self.df = pd.DataFrame(df_records)
+                self.embeddings = torch.tensor(tensor_list)
+                print(f"   ✅ {len(self.df)} registros cargados y sincronizados.")
+            else:
+                print(f"   ❌ ERROR: No se encontraron vectores para '{fuente}' en la DB.")
+                
+            cursor.close()
             
         except Exception as e:
-            print(f"❌ Error SQL: {e}")
+            print(f"❌ Error de conexión a DB: {e}")
         finally:
             if conn: 
                 conn.close()
+                
+        print(f"⏱️ Tiempo total de descarga: {time.time() - start:.2f}s\n")
+
+    def load_from_postgres(self, db_config=None, limit=None, force_refresh=False):
+        """Compatible con app.py para YouTube"""
+        self.source_name = "youtube_channels_db"
+        self._load_from_db(self.source_name)
 
     def load_from_json(self, json_path, force_refresh=False):
-        """Carga apps desde archivo JSON"""
-        self.source_name = os.path.basename(json_path).replace('.json', '') + "_hybrid"
-        print(f"📂 Cargando JSON: {json_path}...")
-        
-        # Clear cache if forced
-        if force_refresh:
-            self._clear_cache()
-        
-        try:
-            with open(json_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            self.df = pd.DataFrame(data)
-            self.df.fillna('', inplace=True)
-            
-            self.df['desc_final'] = self.df.apply(
-                lambda row: row.get('desc_larga', '') if len(str(row.get('desc_larga', ''))) > 10 else row.get('desc_corta', ''), 
-                axis=1
-            )
-            
-            col_titulo = 'titulo_store' if 'titulo_store' in self.df.columns else 'titulo'
-            self.df['common_title'] = self.df[col_titulo]
-            
-            # Texto para E5 (con prefijo 'passage:')
-            self.df['texto_ia'] = "passage: " + (
-                "App: " + self.df['common_title'].astype(str) + ". " +
-                "Género: " + self.df.get('genero', '').astype(str) + ". " +
-                "Descripción: " + self.df['desc_final'].astype(str)
-            )
-            
-            # Texto para BM25 (sin prefijo, limpio)
-            self.df['texto_bm25'] = (
-                self.df['common_title'].astype(str) + " " +
-                self.df.get('genero', '').astype(str) + " " +
-                self.df['desc_final'].astype(str)
-            )
-            
-            self.df = self.df[self.df['texto_ia'].str.len() > 25].reset_index(drop=True)
-            
-            print(f"✅ {len(self.df)} apps cargadas.")
-            self._manage_embeddings()
-            
-        except Exception as e:
-            print(f"❌ Error JSON: {e}")
-
-    def _clear_cache(self):
-        """Elimina caché existente para forzar regeneración"""
-        cache_patterns = [
-            f"{self.source_name}_embeddings.pkl",
-            f"{self.source_name}_bm25.pkl"
-        ]
-        
-        for pattern in cache_patterns:
-            cache_file = os.path.join(self.cache_dir, pattern)
-            if os.path.exists(cache_file):
-                os.remove(cache_file)
-                print(f"🗑️ Caché eliminado: {pattern}")
-
-    def _manage_embeddings(self):
-        """Genera o carga embeddings E5 + índice BM25"""
-        cache_file = os.path.join(self.cache_dir, f"{self.source_name}_embeddings.pkl")
-        bm25_cache_file = os.path.join(self.cache_dir, f"{self.source_name}_bm25.pkl")
-        
-        # === EMBEDDINGS E5 ===
-        if os.path.exists(cache_file):
-            print(f"💾 Cargando caché E5: {cache_file}...")
-            with open(cache_file, 'rb') as f:
-                cached_data = pickle.load(f)
-            if len(cached_data) == len(self.df):
-                self.embeddings = cached_data
-                print("✅ Embeddings E5 listos.")
-            else:
-                print("⚠️ Caché inválido, regenerando...")
-                self._generate_embeddings(cache_file)
-        else:
-            self._generate_embeddings(cache_file)
-        
-        # === ÍNDICE BM25 ===
-        if os.path.exists(bm25_cache_file):
-            print(f"💾 Cargando caché BM25: {bm25_cache_file}...")
-            with open(bm25_cache_file, 'rb') as f:
-                self.bm25 = pickle.load(f)
-            print("✅ Índice BM25 listo.")
-        else:
-            self._generate_bm25_index(bm25_cache_file)
-
-    def _generate_embeddings(self, cache_file):
-        """Genera embeddings E5"""
-        print("⚡ Generando embeddings E5...")
-        start = time.time()
-        self.embeddings = self.model.encode(
-            self.df['texto_ia'].tolist(), 
-            convert_to_tensor=True,
-            show_progress_bar=True,
-            normalize_embeddings=True
-        )
-        print(f"⏱️ Tiempo E5: {time.time() - start:.2f}s")
-        
-        with open(cache_file, 'wb') as f:
-            pickle.dump(self.embeddings, f)
-        print(f"💾 Caché guardado: {cache_file}")
-
-    def _generate_bm25_index(self, cache_file):
-        """Genera índice BM25"""
-        print("🔤 Creando índice BM25...")
-        start = time.time()
-        
-        # Tokenizar corpus 
-        tokenized_corpus = [
-            normalize_text(doc)
-            for doc in self.df['texto_bm25'].tolist()
-        ]
-        self.bm25 = BM25Okapi(tokenized_corpus)
-        
-        print(f"⏱️ Tiempo BM25: {time.time() - start:.2f}s")
-        
-        with open(cache_file, 'wb') as f:
-            pickle.dump(self.bm25, f)
-        print(f"💾 Caché guardado: {cache_file}")
+        """Compatible con app.py para las Apps (ya no lee el JSON, usa la DB)"""
+        # Extraemos "mp.audience.2" de la ruta "apps_scraped_2024/mp.audience.2.json"
+        fuente = os.path.basename(json_path).replace('.json', '')
+        self.source_name = fuente
+        self._load_from_db(fuente)
 
     def search(self, 
                query, 
@@ -272,36 +154,12 @@ class RecommendationEngine:
                bm25_negative_penalty=0.7,
                negative_boost_factor=1):
         """
-        Búsqueda híbrida compatible con tu interfaz Streamlit.
-        
-        MISMA FIRMA QUE TU CÓDIGO ORIGINAL - No necesitas cambiar app.py
-        Los parámetros nuevos son opcionales con defaults inteligentes.
-        
-        Args:
-            query: Consulta de búsqueda
-            negative_query: Términos a penalizar/excluir (opcional)
-            top_k: Número de resultados
-            filters: Dict con 'genero', 'score_min', etc.
-            semantic_weight: Peso búsqueda semántica (0-1)
-            lexical_weight: Peso búsqueda léxica (0-1)
-            hard_negative_filter: Si True, EXCLUYE resultados con negative keywords (recomendado)
-            bm25_negative_penalty: Penalización BM25 para negative keywords (0-1, 0.7 = -70%)
-            negative_boost_factor: Boost para resultados SIN negative keywords (>1.0)
-        
-        Returns:
-            Lista de resultados con estructura:
-            {
-                'score': float,
-                'titulo': str,
-                'descripcion': str,
-                'metadata': dict
-            }
+        Búsqueda híbrida inalterada.
         """
         if self.embeddings is None or self.bm25 is None:
-            print("❌ Embeddings o BM25 no inicializados")
+            print("❌ Embeddings o BM25 no están cargados en memoria")
             return []
 
-        # Normalizar pesos
         total_weight = semantic_weight + lexical_weight
         if abs(total_weight - 1.0) > 0.01:
             semantic_weight = semantic_weight / total_weight
@@ -313,35 +171,26 @@ class RecommendationEngine:
         query_text = "query: " + query
         query_vec = self.model.encode(query_text, convert_to_tensor=True, normalize_embeddings=True)
         
-        # Query negativa
         if negative_query:
             neg_text = "query: " + negative_query
             neg_vec = self.model.encode(neg_text, convert_to_tensor=True, normalize_embeddings=True)
             query_vec = query_vec - (neg_vec * 0.8)
         
-        # ESTRATEGIA OPTIMIZADA PARA RANKING CONSISTENTE:
-        # Traer suficientes candidatos para garantizar ranking global,
-        # pero sin procesar TODO el corpus (rendimiento)
-        # Fórmula: max(1000, top_k * 10, 10% del corpus)
         candidate_size = max(1000, top_k * 10, int(len(self.df) * 0.1))
-        candidate_size = min(candidate_size, len(self.df))  # No exceder tamaño corpus
+        candidate_size = min(candidate_size, len(self.df))
         
-        # Búsqueda semántica con candidatos suficientes
         semantic_hits = util.semantic_search(query_vec, self.embeddings, top_k=candidate_size)
         
         # ==========================================
         # BÚSQUEDA LÉXICA (BM25)
         # ==========================================
         tokenized_query = normalize_text(query)
-
         bm25_scores = self.bm25.get_scores(tokenized_query)
         
-        # Preparar negative keywords para filtrado/penalización
         negative_keywords = set()
         if negative_query:
             negative_keywords = set(normalize_text(negative_query))
             
-            # Penalizar scores BM25 si contienen negative keywords
             if bm25_negative_penalty > 0:
                 for idx in range(len(bm25_scores)):
                     row = self.df.iloc[idx]
@@ -360,12 +209,10 @@ class RecommendationEngine:
         # ==========================================
         combined_scores = {}
         
-        # Agregar scores semánticos
         for hit in semantic_hits[0]:
             idx = hit['corpus_id']
             combined_scores[idx] = float(hit['score']) * semantic_weight
         
-        # Normalizar y agregar scores BM25, REVISAR!!!
         max_bm25 = max(bm25_scores) if max(bm25_scores) > 0 else 1.0
         for idx, bm25_score in enumerate(bm25_scores):
             normalized_bm25 = bm25_score / max_bm25
@@ -375,7 +222,6 @@ class RecommendationEngine:
             else:
                 combined_scores[idx] = normalized_bm25 * lexical_weight
         
-        # Ordenar por score combinado
         sorted_indices = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
         
         # ==========================================
@@ -383,7 +229,6 @@ class RecommendationEngine:
         # ==========================================
         results = []
         excluded_count = 0
-        boosted_count = 0
         
         for idx, combined_score in sorted_indices:
             if len(results) >= top_k:
@@ -391,10 +236,7 @@ class RecommendationEngine:
             
             row = self.df.iloc[idx]
             
-            # === FILTRO DURO DE NEGATIVE KEYWORDS ===
             if hard_negative_filter and negative_keywords:
-                
-                # 2. Construimos un texto que incluya ABSOLUTAMENTE TODO
                 texto_para_filtrar = " ".join([
                     str(row.get('channel_title', '')),
                     str(row.get('common_title', '')),
@@ -404,25 +246,18 @@ class RecommendationEngine:
                     str(row.get('genero', ''))                  
                 ])
                 
-           
                 texto_normalizado = normalize_text(texto_para_filtrar)
-                
-                # 3. Buscamos coincidencias
                 has_negative = any(keyword in texto_normalizado for keyword in negative_keywords)
 
-                
                 if has_negative:
                     excluded_count += 1
-                    continue  # EXCLUIR COMPLETAMENTE
+                    continue
             
-            # === FILTROS DUROS ===
             if filters:
-                # Filtro por género
                 if 'genero' in filters and filters['genero']:
                     if filters['genero'].lower() not in str(row.get('genero', '')).lower():
                         continue
                 
-                # Filtro por score mínimo
                 if 'score_min' in filters:
                     try:
                         val = float(row.get('score', 0))
@@ -431,19 +266,16 @@ class RecommendationEngine:
                     if val < filters['score_min']:
                         continue
                 
-                # Filtro por keywords que DEBEN aparecer
                 if 'must_contain' in filters and filters['must_contain']:
                     texto_completo = str(row.get('channel_title', '')) + " " + str(row.get('channel_description', ''))
                     if filters['must_contain'].lower() not in texto_completo.lower():
                         continue
                 
-                # Filtro por keywords que NO deben aparecer
                 if 'must_not_contain' in filters and filters['must_not_contain']:
                     texto_completo = str(row.get('channel_title', '')) + " " + str(row.get('channel_description', ''))
                     if filters['must_not_contain'].lower() in texto_completo.lower():
                         continue
             
-            # === EXTRAER DATOS (Compatible con tu interfaz) ===
             title = row.get('channel_title') or row.get('common_title') or "Sin Título"
             desc = row.get('channel_description') or row.get('desc_final') or ""
             
