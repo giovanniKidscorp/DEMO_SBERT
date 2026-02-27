@@ -9,14 +9,18 @@ st.set_page_config(
     page_icon="🚀",
     layout="wide"
 )
-MAPA_EDADES = {
-    "mp.audience.2.json": "Preescolar (3-5 años)",
-    "mp.audience.3.json": "Niños (6-9 años)",
-    "mp.audience.4.json": "Tweens (10-12 años)",
-    "mp.audience.5.json": "Teens (13-18 años)"
+
+# --- MAPA DE FUENTES (Ahora viven en la Nube) ---
+FUENTES_APPS = {
+    "mp.audience.2": "Preescolar (3-5 años)",
+    "mp.audience.3": "Niños (6-9 años)",
+    "mp.audience.4": "Tweens (10-12 años)",
+    "mp.audience.5": "Teens (13-18 años)"
 }
-def formatear_nombre(nombre_archivo):
-    return MAPA_EDADES.get(nombre_archivo, nombre_archivo)
+
+def formatear_nombre(fuente_id):
+    return FUENTES_APPS.get(fuente_id, fuente_id)
+
 # --- ESTILOS CSS ---
 st.markdown("""
 <style>
@@ -30,7 +34,7 @@ st.markdown("""
 @st.cache_resource
 def load_engine():
     # Inicializamos el motor. 
-    # Asegúrate de tener tu archivo .env en la misma carpeta para las credenciales de DB
+    # Asegúrate de tener tus variables de entorno configuradas en Streamlit Cloud
     return RecommendationEngine()
 
 engine = load_engine()
@@ -49,71 +53,60 @@ with st.sidebar:
     
     st.divider()
 
-    # --- CASO A: APPS ---
+    # --- CASO A: APPS (DESDE POSTGRES) ---
     if fuente_seleccionada == "📱 Apps (Play Store)":
-        st.subheader("📂 1. Cargar Datos")
-        CARPETA_DATOS = "apps_scraped_2024"
+        st.subheader("☁️ 1. Cargar Datos (Nube)")
         
-        # Lógica de carga de archivo (igual que antes)
-        if os.path.exists(CARPETA_DATOS):
-            archivos = [f for f in os.listdir(CARPETA_DATOS) if f.endswith('.json')]
-            if archivos:
-                archivo_json = st.selectbox("Selecciona Audiencia:", archivos,format_func=formatear_nombre)
+        # Selector basado en los identificadores de la base de datos
+        fuente_id = st.selectbox(
+            "Selecciona Audiencia:", 
+            list(FUENTES_APPS.keys()), 
+            format_func=formatear_nombre
+        )
+        
+        if st.button("🔄 Descargar Dataset", type="primary"):
+            with st.spinner(f"Descargando {formatear_nombre(fuente_id)} desde Postgres..."):
+                engine._load_from_db(fuente_id)
+                engine.source_name = fuente_id  # Guardamos la referencia activa
                 
-                if st.button("🔄 Cargar Dataset", type="primary"):
-                    with st.spinner("Procesando..."):
-                        ruta = os.path.join(CARPETA_DATOS, archivo_json)
-                        engine.load_from_json(ruta)
-                    st.success("✅ Datos actualizados")
+            if not engine.df.empty:
+                st.success(f"✅ ¡{len(engine.df)} apps cargadas al instante!")
             else:
-                st.warning("Carpeta vacía.")
+                st.error("❌ No se encontraron datos. Revisa la base de datos.")
         
         st.subheader("🛡️ 2. Filtros Activos")
         
-        # Verificamos si hay datos cargados para leer los géneros
-        if not engine.df.empty and 'genero' in engine.df.columns:
-            # 1. Extraemos géneros únicos y limpiamos vacíos
+        # Verificamos si hay datos cargados de apps para leer los géneros
+        if not engine.df.empty and 'genero' in engine.df.columns and engine.source_name in FUENTES_APPS:
             lista_generos = sorted([x for x in engine.df['genero'].unique() if x])
-            # Agregamos opción "Todos" al principio
             lista_generos.insert(0, "Todos")
             
-            # 2. Widget de Selección Inteligente
             genero_ui = st.selectbox("Filtrar por Género:", lista_generos)
-            
-            # Lógica para pasar al motor
-            # Si elige "Todos", pasamos None (sin filtro)
             filtro_genero = genero_ui if genero_ui != "Todos" else None
-            
-            # Métrica visual
-            st.caption(f"📚 {len(lista_generos)-1} categorías detectadas en este archivo.")
-            
+            st.caption(f"📚 {len(lista_generos)-1} categorías detectadas.")
         else:
             st.info("⚠️ Carga un dataset primero para ver los géneros.")
             filtro_genero = None
 
-        # Slider de Score (Siempre visible)
+        # Slider de Score
         filtro_score = st.slider("Calificación Mínima ⭐", 0.0, 5.0, 4.0, 0.5)
 
-    # --- OPCIÓN B: YOUTUBE (POSTGRESQL) ---
+    # --- OPCIÓN B: YOUTUBE (DESDE POSTGRES) ---
     else:
         st.subheader("☁️ Conexión a Base de Datos")
-        st.info("Conectando a AWS RDS (Kidscorp Youtube)")
+        st.info("Conectando a AWS RDS (Kidscorp Producto)")
         
-        # Límite para no traerse millones de canales de golpe
-        limit_db = st.number_input("Límite de Canales a analizar", 1000, 50000, 10000, step=1000,disabled=True)
-        
+        # Ya no pedimos límite porque bajamos el bloque exacto procesado
         if st.button("🔄 Conectar y Descargar", type="primary"):
-            with st.spinner("Conectando a Postgres y generando vectores..."):
-                # La función load_from_postgres usa os.getenv para las credenciales
-                engine.load_from_postgres(limit=limit_db)
+            with st.spinner("Descargando base de YouTube desde la nube..."):
+                engine._load_from_db("youtube_channels_db")
+                engine.source_name = "youtube_channels_db"
             
             if not engine.df.empty:
                 st.success(f"✅ DB Conectada. {len(engine.df)} canales listos.")
             else:
                 st.error("❌ No se pudieron cargar datos. Revisa la conexión.")
 
-        # Filtros específicos de YOUTUBE (Si quisieras agregar alguno)
-        # Por ahora YouTube no tiene Score o Genero estandarizado en tu tabla
         filtro_score = 0
         filtro_genero = None
 
@@ -122,11 +115,10 @@ with st.sidebar:
 # 🔽 ÁREA PRINCIPAL: BÚSQUEDA 🔽
 # ==========================================
 
-# Título dinámico
 if fuente_seleccionada.startswith("📱"):
-    st.title("📱 Keyword search")
+    st.title("📱 Keyword Search (Cloud)")
 else:
-    st.title("📺 Buscador de Canales YouTube")
+    st.title("📺 Buscador de Canales YouTube (Cloud)")
 
 col_search, col_neg = st.columns([3, 1])
 with col_search:
@@ -140,7 +132,7 @@ top_k = st.slider("Cantidad de resultados", 1, 10000, 5)
 # --- LÓGICA DE EJECUCIÓN ---
 if query:
     if engine.embeddings is None:
-        st.warning("⚠️ El motor está vacío. Por favor CARGA un dataset en la barra lateral izquierda.")
+        st.warning("⚠️ El motor está vacío. Por favor haz clic en 'Descargar Dataset' en el panel lateral.")
     else:
         start_time = time.time()
         
@@ -165,81 +157,60 @@ if query:
         if not resultados:
             st.info("No se encontraron coincidencias con esos filtros.")
 
-        # --- MOSTRAR RESULTADOS (Adaptativo) ---
+        # --- MOSTRAR RESULTADOS ---
         for item in resultados:
             score_ia = item['score']
             meta = item['metadata']
             titulo = item['titulo']
             desc = item['descripcion']
-            url_destino = "#"
-            texto_link = "placeholder"
-            # Icono según score
+            
             icono = "🔥" if score_ia > 0.55 else "✨"
-            # --- DISEÑO PARA APPS ---
-            # 1. Preparar datos según la fuente
-
+            
             if fuente_seleccionada.startswith("📱"):
                 # --- MODO APPS ---
                 es_app = True
-                # Link
-                app_id = item['metadata'].get('id') or item['metadata'].get('app_id')
+                app_id = meta.get('id') or meta.get('app_id')
                 url_destino = f"https://play.google.com/store/apps/details?id={app_id}" if app_id else "#"
                 texto_link = "📲 Play Store"
                 
-                # Datos Visuales
                 etiqueta_score = f"⭐ {meta.get('score', 'N/A')}"
                 etiqueta_centro = meta.get('genero', 'Sin género')
                 titulo_centro = "Género"
+                kws = ""
                 
             else:
                 # --- MODO YOUTUBE ---
                 es_app = False
-                # Link
-                custom_url = item['metadata'].get('channel_customurl')
+                custom_url = meta.get('channel_customurl')
                 if custom_url:
-                    if custom_url.startswith("http"):
-                        url_destino = custom_url
-                    else:
-                        url_destino = f"https://www.youtube.com/{custom_url}"
+                    url_destino = custom_url if custom_url.startswith("http") else f"https://www.youtube.com/{custom_url}"
                     texto_link = "📺 Ver Canal"
                 else:
                     url_destino = "#"
                     texto_link = "🚫 Sin Link"
                     
-                # Datos Visuales (Limpieza de estrellas)
-                etiqueta_score = "YouTube" # En vez de estrellas, ponemos un texto fijo
-                # En vez de género, mostramos las primeras keywords o "Canal"
+                etiqueta_score = "YouTube" 
                 kws = meta.get('channel_bs_ch_keywords', '')
                 etiqueta_centro = "Video / Canal"
                 titulo_centro = "Tipo"
 
             # 2. RENDERIZADO VISUAL
-            # Usamos score_ia (similitud) para el título del expander
             with st.expander(f"{icono} {titulo} (Similitud: {score_ia:.3f})", expanded=True):
-                
-                # Dividimos en columnas
                 c1, c2, c3 = st.columns([1, 1, 3])
                 
                 with c1:
-                    # COLUMNA IZQUIERDA: Score o Distintivo
                     if es_app:
                         st.metric("Score", etiqueta_score)
                     else:
-                        # Para YouTube usamos un botón estático o badge, no un st.metric con números
                         st.markdown(f"#### 📺 Canal")
                     
-                    # Botón de Link (Común para ambos)
                     if url_destino != "#":
                         st.link_button(texto_link, url_destino)
 
                 with c2:
-                    # COLUMNA CENTRO: Género o Tipo
                     st.metric(titulo_centro, etiqueta_centro)
 
                 with c3:
-                    # COLUMNA DERECHA: Descripción
                     st.markdown(f"**Descripción:** {desc}")
-                    
-                    # Extra para YouTube: Mostrar Keywords abajo si existen
                     if not es_app and kws:
                         st.caption(f"🏷️ **Keywords:** {kws[:150]}...")
