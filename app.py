@@ -122,7 +122,7 @@ else:
 
 col_search, col_neg = st.columns([3, 1])
 with col_search:
-    query = st.text_input("🔎 Concepto a buscar:", placeholder="Ej: aprender matemáticas divirtiéndose")
+    query = st.text_input("🔎 Concepto a buscar: (Separar por coma conceptos distintos. Ej: 'back to school, tennis')", placeholder="Ej: aprender matemáticas divirtiéndose")
 with col_neg:
     neg_query = st.text_input("⛔ Excluir concepto:", placeholder="Ej: violencia, anuncios")
 

@@ -50,6 +50,14 @@ def normalize_text(text: str):
         and len(token) > 2
     ]
     return tokens
+def parsear_conceptos(query: str):
+    """
+    Separa la query por comas si existen, limpiando los espacios extra.
+    Ej: "back to school, tennis, jockey" -> ["back to school", "tennis", "jockey"]
+    """
+    if ',' in query:
+        return [concepto.strip() for concepto in query.split(',') if concepto.strip()]
+    return [query.strip()]
 
 class RecommendationEngine:
     def __init__(self, model_name='intfloat/multilingual-e5-base'):
@@ -153,12 +161,16 @@ class RecommendationEngine:
             semantic_weight = semantic_weight / total_weight
             lexical_weight = lexical_weight / total_weight
 
+        conceptos_lista = parsear_conceptos(query)
+
         # SEMÁNTICA (E5)
-        query_text = "query: " + query
+        query_text = "query: " + ", ".join(conceptos_lista)
         query_vec = self.model.encode(query_text, convert_to_tensor=True, normalize_embeddings=True)
-        
+
         if negative_query:
-            neg_text = "query: " + negative_query
+            # Hacemos lo mismo con las negativas si el usuario usa comas
+            neg_conceptos = parsear_conceptos(negative_query)
+            neg_text = "query: " + ", ".join(neg_conceptos)
             neg_vec = self.model.encode(neg_text, convert_to_tensor=True, normalize_embeddings=True)
             query_vec = query_vec - (neg_vec * 0.8)
         
