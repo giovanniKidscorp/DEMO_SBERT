@@ -163,12 +163,15 @@ class RecommendationEngine:
 
         conceptos_lista = parsear_conceptos(query)
 
-        # SEMÁNTICA (E5)
-        query_text = "query: " + ", ".join(conceptos_lista)
-        query_vec = self.model.encode(query_text, convert_to_tensor=True, normalize_embeddings=True)
+        # 1. PARSEAMOS LOS CONCEPTOS
+        conceptos = parsear_conceptos(query)
 
+        # SEMÁNTICA (E5)
+        # Pasamos los conceptos unidos por coma para que E5 entienda la enumeración
+        query_text = "query: " + ", ".join(conceptos)
+        query_vec = self.model.encode(query_text, convert_to_tensor=True, normalize_embeddings=True)
+        
         if negative_query:
-            # Hacemos lo mismo con las negativas si el usuario usa comas
             neg_conceptos = parsear_conceptos(negative_query)
             neg_text = "query: " + ", ".join(neg_conceptos)
             neg_vec = self.model.encode(neg_text, convert_to_tensor=True, normalize_embeddings=True)
@@ -180,12 +183,31 @@ class RecommendationEngine:
         semantic_hits = util.semantic_search(query_vec, self.embeddings, top_k=candidate_size)
         
         # LÉXICA (BM25)
-        tokenized_query = normalize_text(query)
+        bm25_tokens = []
+        for c in conceptos:
+            # Agregamos palabras sueltas ("back", "school", "tennis")
+            bm25_tokens.extend(normalize_text(c)) 
+            # Si hay espacios, agregamos también la palabra fusionada ("backtoschool")
+            if ' ' in c:
+                bm25_tokens.append(c.replace(' ', '').lower())
+                
+        # Eliminamos duplicados manteniendo el formato de lista
+        tokenized_query = list(dict.fromkeys(bm25_tokens))
         bm25_scores = self.bm25.get_scores(tokenized_query)
         
+        # NEGATIVOS LÉXICOS (BM25)
         negative_keywords = set()
         if negative_query:
-            negative_keywords = set(normalize_text(negative_query))
+            # Hacemos el mismo tratamiento (separar y fusionar) para las palabras a excluir
+            neg_conceptos = parsear_conceptos(negative_query)
+            neg_tokens = []
+            for c in neg_conceptos:
+                neg_tokens.extend(normalize_text(c))
+                if ' ' in c:
+                    neg_tokens.append(c.replace(' ', '').lower())
+            
+            negative_keywords = set(neg_tokens)
+            
             if bm25_negative_penalty > 0:
                 for idx in range(len(bm25_scores)):
                     # ESCUDO: Evitar IndexError si BM25 tiene más datos que la DB
