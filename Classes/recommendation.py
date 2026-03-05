@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 import spacy
 from functools import lru_cache
 from lingua import Language, LanguageDetectorBuilder
+import gc  # Garbage collector para limpiar memoria
 
 # Construimos detector solo con los idiomas que nos interesan
 LANGUAGES = [Language.SPANISH, Language.ENGLISH, Language.PORTUGUESE]
@@ -50,6 +51,7 @@ def normalize_text(text: str):
         and len(token) > 2
     ]
     return tokens
+
 def parsear_conceptos(query: str):
     """
     Separa la query por comas si existen, limpiando los espacios extra.
@@ -70,6 +72,10 @@ class RecommendationEngine:
         self.source_name = ""
 
     def _load_from_db(self, fuente):
+        """
+        Carga datos desde PostgreSQL con optimización para datasets grandes (>10K).
+        Usa procesamiento por lotes para evitar saturar la RAM.
+        """
         print(f"\n☁️ Conectando a Postgres para cargar: '{fuente}'")
         start = time.time()
         
@@ -85,7 +91,9 @@ class RecommendationEngine:
             )
             cursor = conn.cursor()
             
-            # 1. Cargar BM25
+            # ═══════════════════════════════════════════════════════
+            # 1. CARGAR BM25 (Ligero, ~5-10 MB)
+            # ═══════════════════════════════════════════════════════
             print("   📥 Descargando índice léxico (BM25)...")
             cursor.execute("SELECT archivo_pickle FROM keywordsearch.archivos_bm25 WHERE fuente = %s", (fuente,))
             row = cursor.fetchone()
@@ -95,44 +103,147 @@ class RecommendationEngine:
             else:
                 print(f"   ❌ ERROR: No se encontró BM25 para '{fuente}'.")
                 
-            # 2. Cargar Vectores y Metadata
-            print("   📥 Descargando vectores semánticos (E5) y metadata...")
+            # ═══════════════════════════════════════════════════════
+            # 2. CONTAR REGISTROS (para estimar memoria)
+            # ═══════════════════════════════════════════════════════
+            print("   📊 Contando registros...")
             cursor.execute("""
-                SELECT metadata, embedding::text 
+                SELECT COUNT(*) 
                 FROM keywordsearch.vectores_e5 
                 WHERE fuente = %s
-                ORDER BY id ASC
             """, (fuente,))
-            rows = cursor.fetchall()
+            total_rows = cursor.fetchone()[0]
+            print(f"   📊 Total de registros: {total_rows:,}")
             
-            if rows:
-                df_records = []
-                tensor_list = []
-                
-                print("   ⚙️ Procesando memoria (Esto puede tomar unos segundos en YouTube)...")
-                for meta, emb_str in rows:
-                    df_records.append(meta)
-                    # OPTIMIZACIÓN CRÍTICA: np.fromstring no satura la memoria RAM como json.loads
-                    arr = np.fromstring(emb_str[1:-1], sep=',')
-                    tensor_list.append(arr)
-                    
-                self.df = pd.DataFrame(df_records)
-                # Convertimos todo a un solo bloque de memoria contigua en Torch
-                self.embeddings = torch.tensor(np.array(tensor_list), dtype=torch.float32)
-                
-                print(f"   ✅ {len(self.df)} registros cargados y sincronizados.")
+            # Estimación de memoria
+            # Cada embedding: 768 floats × 4 bytes = 3,072 bytes ≈ 3 KB
+            # 41,000 registros × 3 KB = 123 MB (embeddings)
+            # + metadata (varía, ~2-5 KB por registro) = ~100-200 MB
+            # Total estimado: 200-350 MB
+            estimated_mb = (total_rows * 3072) / (1024 * 1024)
+            print(f"   💾 Memoria estimada para embeddings: {estimated_mb:.1f} MB")
+            
+            # ═══════════════════════════════════════════════════════
+            # 3. ESTRATEGIA DE CARGA SEGÚN TAMAÑO
+            # ═══════════════════════════════════════════════════════
+            if total_rows <= 10000:
+                # Dataset pequeño: Cargar todo de una vez
+                print("   ⚡ Dataset pequeño: Carga directa")
+                self._load_direct(cursor, fuente, total_rows)
             else:
-                print(f"   ❌ ERROR: No se encontraron vectores para '{fuente}'.")
-                
+                # Dataset grande: Cargar por lotes
+                print("   🔄 Dataset grande: Carga por lotes")
+                self._load_batched(cursor, fuente, total_rows)
+            
             cursor.close()
+            
+            # Forzar recolección de basura
+            gc.collect()
             
         except Exception as e:
             print(f"❌ Error de conexión a DB: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             if conn: 
                 conn.close()
                 
         print(f"⏱️ Tiempo total de descarga: {time.time() - start:.2f}s\n")
+
+    def _load_direct(self, cursor, fuente, total_rows):
+        """
+        Carga directa para datasets pequeños (<10K registros).
+        """
+        cursor.execute("""
+            SELECT metadata, embedding::text 
+            FROM keywordsearch.vectores_e5 
+            WHERE fuente = %s
+            ORDER BY id ASC
+        """, (fuente,))
+        rows = cursor.fetchall()
+        
+        if rows:
+            df_records = []
+            tensor_list = []
+            
+            for meta, emb_str in rows:
+                df_records.append(meta)
+                arr = np.fromstring(emb_str[1:-1], sep=',')
+                tensor_list.append(arr)
+                
+            self.df = pd.DataFrame(df_records)
+            self.embeddings = torch.tensor(np.array(tensor_list), dtype=torch.float32)
+            
+            print(f"   ✅ {len(self.df)} registros cargados")
+        else:
+            print(f"   ❌ ERROR: No se encontraron vectores para '{fuente}'.")
+
+    def _load_batched(self, cursor, fuente, total_rows):
+        """
+        Carga por lotes para datasets grandes (>10K registros).
+        Procesa en chunks de 5,000 registros para no saturar memoria.
+        """
+        BATCH_SIZE = 5000
+        num_batches = (total_rows + BATCH_SIZE - 1) // BATCH_SIZE
+        
+        print(f"   📦 Procesando en {num_batches} lotes de {BATCH_SIZE:,} registros...")
+        
+        df_records = []
+        embeddings_arrays = []
+        
+        for batch_num in range(num_batches):
+            offset = batch_num * BATCH_SIZE
+            
+            print(f"   ⏳ Lote {batch_num + 1}/{num_batches} (registros {offset:,} - {min(offset + BATCH_SIZE, total_rows):,})...", end='', flush=True)
+            
+            # Cargar lote con LIMIT y OFFSET
+            cursor.execute("""
+                SELECT metadata, embedding::text 
+                FROM keywordsearch.vectores_e5 
+                WHERE fuente = %s
+                ORDER BY id ASC
+                LIMIT %s OFFSET %s
+            """, (fuente, BATCH_SIZE, offset))
+            
+            batch_rows = cursor.fetchall()
+            
+            if not batch_rows:
+                print(" ⚠️ Vacío, saliendo.")
+                break
+            
+            # Procesar lote
+            batch_start = time.time()
+            
+            for meta, emb_str in batch_rows:
+                df_records.append(meta)
+                # Parsear embedding de forma eficiente
+                arr = np.fromstring(emb_str[1:-1], sep=',', dtype=np.float32)
+                embeddings_arrays.append(arr)
+            
+            batch_time = time.time() - batch_start
+            print(f" ✓ ({batch_time:.1f}s)")
+            
+            # Liberar memoria del lote
+            del batch_rows
+            gc.collect()
+        
+        print("   🔧 Consolidando datos...")
+        
+        # Convertir todo a DataFrame y Tensor de una vez
+        self.df = pd.DataFrame(df_records)
+        
+        # OPTIMIZACIÓN CRÍTICA: np.vstack es más eficiente que crear lista y luego array
+        print("   🔧 Construyendo tensor de embeddings...")
+        embeddings_np = np.vstack(embeddings_arrays)
+        self.embeddings = torch.tensor(embeddings_np, dtype=torch.float32)
+        
+        print(f"   ✅ {len(self.df):,} registros cargados y sincronizados.")
+        
+        # Limpiar memoria temporal
+        del df_records
+        del embeddings_arrays
+        del embeddings_np
+        gc.collect()
 
     def load_from_postgres(self, db_config=None, limit=None, force_refresh=False):
         self.source_name = "youtube_channels_db"
@@ -160,8 +271,6 @@ class RecommendationEngine:
         if abs(total_weight - 1.0) > 0.01:
             semantic_weight = semantic_weight / total_weight
             lexical_weight = lexical_weight / total_weight
-
-        conceptos_lista = parsear_conceptos(query)
 
         # 1. PARSEAMOS LOS CONCEPTOS
         conceptos = parsear_conceptos(query)
