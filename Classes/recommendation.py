@@ -191,13 +191,13 @@ def calcular_score_metricas(row: dict, stats: dict) -> float:
     # avg_like_ratio = (total_likes / total_views) × 100
     # Mide interacción relativa — un canal pequeño con muchos likes por view
     # puede superar a uno grande con pocos.
-    like_ratio = float(row.get("avg_like_ratio", 0) or 0)
+    like_ratio = float(row.get("avg_like_ratio") or 0)
     s_engagement = _log_normalize(like_ratio, stats["max_like_ratio"])
 
     # ── SUB-SCORE 3: FRECUENCIA (20%) ────────────────────────────────────────
     # videos_por_mes = promedio de videos publicados en los últimos 3 meses / 3
     # Cap en 30 videos/mes para no penalizar canales normales vs. factories de contenido.
-    videos_mes = float(row.get("videos_por_mes", 0) or 0)
+    videos_mes = float(row.get("videos_por_mes") or 0)
     videos_mes_capped = min(videos_mes, 30.0)
     max_frecuencia_capped = min(stats["max_videos_por_mes"], 30.0)
     s_frecuencia = _log_normalize(videos_mes_capped, max_frecuencia_capped)
@@ -206,8 +206,8 @@ def calcular_score_metricas(row: dict, stats: dict) -> float:
     # Combina subscriber_count y avg_views_per_video en un único valor.
     # Fórmula: sqrt(subs × avg_views) — la raíz cuadrada balancea ambos factores.
     # Luego se normaliza con log contra el máximo del dataset.
-    subs = float(row.get("subscriber_count", 0) or 0)
-    avg_views = float(row.get("avg_views_per_video", 0) or 0)
+    subs      = float(row.get("subscriber_count") or 0)
+    avg_views = float(row.get("avg_views_per_video") or 0)
     popularidad_raw = np.sqrt(subs * avg_views) if (subs > 0 and avg_views > 0) else 0.0
     s_popularidad = _log_normalize(popularidad_raw, stats["max_popularidad"])
 
@@ -219,7 +219,7 @@ def calcular_score_metricas(row: dict, stats: dict) -> float:
         s_popularidad * METRIC_WEIGHTS["popularidad"]
     )
 
-    return float(np.clip(score, 0.0, 1.0))
+    return float(np.clip(np.nan_to_num(score, nan=0.0), 0.0, 1.0))
 
 
 def precompute_metric_stats(df: pd.DataFrame) -> dict:
