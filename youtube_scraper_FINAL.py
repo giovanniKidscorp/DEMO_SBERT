@@ -570,6 +570,10 @@ def procesar_youtube_completo():
         archivo = file_info['archivo']
         ruta_entrada = os.path.join(CARPETA_ENTRADA, archivo)
         ruta_salida = os.path.join(CARPETA_SALIDA, archivo)
+        if os.path.exists(ruta_salida):
+            print(f"   ✅ Ya procesado, saltando.\n")
+            continue
+
         ruta_checkpoint = ruta_salida.replace('.json', '_checkpoint.json')
         
         print(f"{'='*70}")
@@ -578,7 +582,6 @@ def procesar_youtube_completo():
         print(f"   Edad: {file_info['edad_display']}")
         print(f"   Género: {file_info['genero_display']}")
         print(f"{'='*70}")
-        
         # Leer canales
         try:
             with open(ruta_entrada, 'r', encoding='utf-8') as f:
@@ -613,24 +616,29 @@ def procesar_youtube_completo():
         # Cargar checkpoint si existe
         resultados = []
         procesados_ids = set()
-        
+        print(f"   🔍 Buscando checkpoint en: '{ruta_checkpoint}'")
+        print(f"   🔍 Existe: {os.path.exists(ruta_checkpoint)}")
         if os.path.exists(ruta_checkpoint):
             try:
+                print(f"   ♻️ Checkpoint encontrado: {ruta_checkpoint}")
                 with open(ruta_checkpoint, 'r', encoding='utf-8') as f:
                     checkpoint_data = json.load(f)
                     resultados = checkpoint_data.get('results', [])
                     procesados_ids = set(r['appid'] for r in resultados)
-                print(f"   ♻️ Checkpoint: {len(resultados)} canales ya procesados")
+                    print(f"   ♻️ Checkpoint: {len(resultados)} canales ya procesados")
                 # AGREGAR ESTO:
                 if resultados:
                     primeros_ids_checkpoint = [r['appid'] for r in resultados[:5]]
                     primeros_ids_lista = channels_list[:5]
                     print(f"   🔍 Primeros IDs en checkpoint: {primeros_ids_checkpoint}")
                     print(f"   🔍 Primeros IDs en lista:      {primeros_ids_lista}")
-            except:
-                pass
+            except Exception as e:
+                print(f"   ❌ Error leyendo checkpoint: {e}")
         
         # Procesar canales
+        print(f"   🔍 procesados_ids tiene {len(procesados_ids)} entradas")
+        print(f"   🔍 Primer canal de la lista: {channels_list[0]}")
+        print(f"   🔍 Está en procesados_ids: {channels_list[0] in procesados_ids}")
         tiempo_inicio_archivo = time.time()
         
         for idx, appid in enumerate(channels_list):
