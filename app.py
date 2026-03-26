@@ -57,7 +57,7 @@ st.markdown("""
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-CARPETA_PKL = "basesTemporales"
+CARPETA_PKL = r"basesTemporales\vectores\content\vectores"
 
 def descubrir_segmentos() -> dict:
     """

@@ -39,5 +39,5 @@ def convertir_archivo(csv_path, json_path):
 
 # --- CONFIGURACIÓN ---
 # Pon aquí la ruta de tu carpeta (ejemplo: 'mis_canales' o './datos')
-carpeta_objetivo = 'youtube_diciembre_2026' 
+carpeta_objetivo = 'apps_diciembre_2026' 
 procesar_carpeta_csv(carpeta_objetivo)

@@ -37,15 +37,16 @@ logging.getLogger("curl_cffi").setLevel(logging.CRITICAL)
 scraper = GPlayScraper(http_client="curl_cffi")
 
 # Carpetas
-CARPETA_ENTRADA = "apps_diciembre_2024"
-CARPETA_SALIDA = "apps_scraped_2024"
+CARPETA_ENTRADA = "apps_diciembre_2026"
+CARPETA_SALIDA = "apps_scraped_2026"
 
 # Archivos a procesar (por edad)
 ARCHIVOS_JSON = [
-    "mp.audience.2.json",  # 2+
-    "mp.audience.3.json",  # 3+
-    "mp.audience.4.json",  # 4+
-    "mp.audience.5.json"   # 5+
+    "Apps_Kids_(6-9).json",  
+    "Apps_Pre_School_(3-5).json", 
+    "Apps_Teens_(16-18).json",  
+    "Apps_Tweens_(10-12).json",   
+    "Apps_Young_Teens_(13-15).json"
 ]
 
 # Campos a extraer de Google Play
@@ -180,7 +181,8 @@ def procesar_inventario_apps():
         ruta_salida = os.path.join(CARPETA_SALIDA, nombre_archivo)
         
         # Extraer edad del nombre del archivo
-        age_rating = nombre_archivo.split('.')[2] + '+'
+        match = re.search(r'\(([^)]+)\)', nombre_archivo)
+        age_rating = match.group(1) if match else "unknown"
         
         print(f"{'='*70}")
         print(f"📂 Procesando: {nombre_archivo} (Edad {age_rating})")
