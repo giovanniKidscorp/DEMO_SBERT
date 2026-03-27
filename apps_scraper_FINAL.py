@@ -65,6 +65,10 @@ CAMPOS_FICHA = [
     "version"
 ]
 
+# Checkpoint / recuperación
+CHECKPOINT_ENABLED = True
+CHECKPOINT_INTERVAL = 10  # Guardar cada N apps procesadas
+
 # ══════════════════════════════════════════════════════════════════════════════
 # FUNCIONES AUXILIARES
 # ══════════════════════════════════════════════════════════════════════════════
@@ -144,6 +148,51 @@ def calcular_engagement_score(score, installs_str):
     return round(engagement * 100, 2)
 
 
+def cargar_checkpoint(ruta_salida_final, ruta_salida_partial):
+    """Carga resultados previos desde final o partial."""
+    data = []
+    fuente = None
+
+    if CHECKPOINT_ENABLED and os.path.exists(ruta_salida_partial):
+        try:
+            with open(ruta_salida_partial, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            fuente = 'partial'
+        except Exception as e:
+            print(f"⚠️ No se pudo leer checkpoint partial ({ruta_salida_partial}): {e}")
+            data = []
+
+    elif os.path.exists(ruta_salida_final):
+        try:
+            with open(ruta_salida_final, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            fuente = 'final'
+        except Exception as e:
+            print(f"⚠️ No se pudo leer archivo final ({ruta_salida_final}): {e}")
+            data = []
+
+    processed_ids = set()
+    for item in data:
+        app_id = item.get('app_id')
+        if app_id:
+            processed_ids.add(app_id)
+
+    if fuente:
+        print(f"   🔁 Recuperando {len(data)} registros desde checkpoint '{fuente}'.")
+
+    return data, processed_ids
+
+
+def guardar_checkpoint(ruta_salida_partial, resultados_archivo):
+    """Guarda checkpoint parcial en archivo .partial."""
+    try:
+        with open(ruta_salida_partial, 'w', encoding='utf-8') as f:
+            json.dump(resultados_archivo, f, ensure_ascii=False, indent=2)
+        print(f"   💾 Checkpoint guardado: {len(resultados_archivo)} apps -> {ruta_salida_partial}")
+    except Exception as e:
+        print(f"⚠️ Error guardando checkpoint parcial: {e}")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # FUNCIÓN PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════════════
@@ -173,6 +222,7 @@ def procesar_inventario_apps():
     # Estadísticas globales
     total_exitosas = 0
     total_fallidas = 0
+    total_reanudadas = 0
     tiempo_inicio_global = time.time()
 
     # Procesar archivo por archivo
@@ -188,9 +238,12 @@ def procesar_inventario_apps():
         print(f"📂 Procesando: {nombre_archivo} (Edad {age_rating})")
         print(f"{'='*70}")
         
-        # Lista de resultados para este archivo
-        resultados_archivo = []
-        
+        # Lista de resultados para este archivo (podemos reanudar desde checkpoint)
+        ruta_salida_parcial = ruta_salida + ".partial"
+        resultados_archivo, processed_app_ids = cargar_checkpoint(ruta_salida, ruta_salida_parcial)
+
+        count_reanudadas = len(processed_app_ids)
+
         # Leer JSON de entrada
         try:
             with open(ruta_entrada, 'r', encoding='utf-8') as f:
@@ -213,17 +266,26 @@ def procesar_inventario_apps():
             continue
 
         # Procesar apps
-        count_exitosas = 0
+        count_exitosas = len(resultados_archivo)
         count_fallidas = 0
         total_apps = len(apps_lista)
         tiempo_inicio_archivo = time.time()
+        apps_iteradas = 0
         
         for idx, item in enumerate(apps_lista):
             # Extraer app_id
             app_id = item.get('appid') or item.get('app_id') or item.get('package_name')
+            apps_iteradas += 1
             
             if not app_id:
                 count_fallidas += 1
+                continue
+
+            if app_id in processed_app_ids:
+                count_reanudadas += 1
+                print(f"   [{idx+1}/{total_apps}] {app_id[:30]}... ⏭️ (ya procesada)")
+                if CHECKPOINT_ENABLED and apps_iteradas % CHECKPOINT_INTERVAL == 0:
+                    guardar_checkpoint(ruta_salida_parcial, resultados_archivo)
                 continue
 
             print(f"   [{idx+1}/{total_apps}] {app_id[:30]}...", end="", flush=True)
@@ -308,9 +370,14 @@ def procesar_inventario_apps():
                 }
 
                 resultados_archivo.append(item_completo)
+                processed_app_ids.add(app_id)
                 print(f" ✅ ({len(reviews_limpias)}r, {len(auto_keywords)}kw)")
                 count_exitosas += 1
                 
+                # Guardar checkpoint periódicamente
+                if CHECKPOINT_ENABLED and apps_iteradas % CHECKPOINT_INTERVAL == 0:
+                    guardar_checkpoint(ruta_salida_parcial, resultados_archivo)
+
                 # Pausa para evitar ban
                 time.sleep(0.2)
 
@@ -320,9 +387,17 @@ def procesar_inventario_apps():
 
         # Guardar resultados de este archivo
         if resultados_archivo:
-            with open(ruta_salida, 'w', encoding='utf-8') as f:
-                json.dump(resultados_archivo, f, ensure_ascii=False, indent=2)
-            
+            if CHECKPOINT_ENABLED:
+                guardar_checkpoint(ruta_salida_parcial, resultados_archivo)
+                try:
+                    os.replace(ruta_salida_parcial, ruta_salida)
+                    print(f"   ✅ Checkpoint final trasladado a: {ruta_salida}")
+                except Exception as e:
+                    print(f"⚠️ No se pudo completar move .partial → final: {e}")
+            else:
+                with open(ruta_salida, 'w', encoding='utf-8') as f:
+                    json.dump(resultados_archivo, f, ensure_ascii=False, indent=2)
+
             tiempo_archivo = time.time() - tiempo_inicio_archivo
             
             print(f"\n💾 Guardado: {ruta_salida}")
@@ -335,6 +410,10 @@ def procesar_inventario_apps():
         # Actualizar estadísticas globales
         total_exitosas += count_exitosas
         total_fallidas += count_fallidas
+        total_reanudadas += count_reanudadas
+
+        if count_reanudadas > 0:
+            print(f"   🔁 Apps ya procesadas (reanudadas): {count_reanudadas}")
 
     # Resumen final
     tiempo_total = time.time() - tiempo_inicio_global
@@ -343,6 +422,7 @@ def procesar_inventario_apps():
     print(f"✨ PROCESO COMPLETO")
     print(f"{'='*70}")
     print(f"✅ Total apps exitosas: {total_exitosas}")
+    print(f"🔁 Total apps reanudadas: {total_reanudadas}")
     print(f"❌ Total apps fallidas: {total_fallidas}")
     print(f"⏱️ Tiempo total: {tiempo_total/60:.1f} minutos")
     print(f"⚡ Velocidad: {total_exitosas/(tiempo_total/60):.1f} apps/min")
