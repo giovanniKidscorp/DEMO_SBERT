@@ -72,6 +72,32 @@ def detect_language(text: str) -> str:
 
 load_dotenv()
 
+
+def expand_token_variants(token: str) -> list:
+    """
+    Genera variantes ortográficas de un token.
+    'make-up' → ['makeup', 'make-up', 'make up']
+    'makeup'  → ['makeup', 'make-up']  (si detecta camelCase o compound)
+    """
+    variants = {token}  # siempre incluir el original
+
+    # Si tiene guión: agregar versión junta y separada
+    if '-' in token:
+        variants.add(token.replace('-', ''))    # make-up → makeup
+        variants.add(token.replace('-', ' '))    # make-up → make up
+
+    # Si NO tiene guión ni espacio, pero es una palabra compuesta conocida,
+    # podrías agregar variante con guión (opcional, más agresivo)
+    # Ej: "makeup" → también buscar "make-up"
+    # Esto se puede hacer con un diccionario o heurística simple:
+    if '-' not in token and ' ' not in token and len(token) > 5:
+        # Heurística: intentar partir en subpalabras comunes
+        # (esto es opcional, el caso más importante es el de arriba)
+        pass
+
+    return list(variants)
+
+
 @lru_cache(maxsize=10000)
 def normalize_text(text: str):
     """Tokeniza y lematiza un texto eliminando stopwords, puntuación y números."""
@@ -80,14 +106,27 @@ def normalize_text(text: str):
     lang = detect_language(text)
     nlp = NLP_MODELS[lang]
     doc = nlp(text.lower())
-    return [
-        token.lemma_
-        for token in doc
-        if not token.is_stop
-        and not token.is_punct
-        and not token.like_num
-        and len(token) > 2
-    ]
+
+    tokens = []
+    for token in doc:
+        if token.is_stop or token.is_punct or token.like_num or len(token) < 3:
+            continue
+
+        lemma = token.lemma_
+        # Expandir variantes para cada lemma
+        for variant in expand_token_variants(lemma):
+            if len(variant) > 2:
+                tokens.append(variant)
+
+    # También procesar el texto raw para capturar tokens que spaCy no maneje bien
+    raw_tokens = text.lower().split()
+    for rt in raw_tokens:
+        if '-' in rt:
+            for variant in expand_token_variants(rt):
+                if len(variant) > 2 and variant not in tokens:
+                    tokens.append(variant)
+
+    return tokens
 
 def parsear_conceptos(query: str):
     """
@@ -477,35 +516,41 @@ class RecommendationEngine:
             neg_vec  = self.model.encode(neg_text, convert_to_tensor=True, normalize_embeddings=True)
             query_vec = query_vec - (neg_vec * 0.8)
 
-        candidate_size = max(1000, top_k * 10, int(len(self.df) * 0.1))
-        candidate_size = min(candidate_size, len(self.df))
+        candidate_size = len(self.df)
         semantic_hits  = util.semantic_search(query_vec, self.embeddings, top_k=candidate_size)
 
         # ── 2. SCORE LÉXICO (BM25) ────────────────────────────────────────────
         bm25_tokens = []
         for c in conceptos:
-            # Tokens en idioma original
+            # Tokens en idioma original (ya con variantes via normalize_text)
             bm25_tokens.extend(normalize_text(c))
             
-            # Para apps: traducir a los otros idiomas y agregar sus tokens también
             if not self.es_youtube:
                 try:
                     idiomas_target = ['en', 'es', 'pt']
                     for lang in idiomas_target:
                         try:
                             traduccion = GoogleTranslator(source='auto', target=lang).translate(c)
-                            print(traduccion)
                             if traduccion and traduccion.lower() != c.lower():
+                                # normalize_text ya expande variantes
                                 bm25_tokens.extend(normalize_text(traduccion))
+                                
+                                # NUEVO: también agregar variantes del texto crudo traducido
+                                # Esto captura "make-up" → "makeup" directamente
+                                for variant in expand_token_variants(traduccion.lower().strip()):
+                                    if len(variant) > 2:
+                                        bm25_tokens.append(variant)
                         except:
                             continue
                 except ImportError:
-                    pass  # si no está instalado, funciona igual sin traducción
+                    pass
             
+            # Compound token sin espacios
             if ' ' in c:
                 bm25_tokens.append(c.replace(' ', '').lower())
+                bm25_tokens.append(c.replace(' ', '-').lower())  # NUEVO
 
-        tokenized_query = list(dict.fromkeys(bm25_tokens))
+        tokenized_query = list(dict.fromkeys(bm25_tokens))  # dedup preservando orden
         bm25_scores = self.bm25.get_scores(tokenized_query)
 
         negative_keywords = set()

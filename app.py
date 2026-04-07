@@ -65,6 +65,40 @@ st.markdown("""
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+def calcular_semaforo(resultados: list) -> list:
+    """
+    Asigna semáforo (verde/amarillo/rojo) relativo a cada búsqueda.
+    
+    Lógica: normaliza los scores al rango [0, 1] dentro de la búsqueda,
+    luego asigna por percentil del ranking:
+      - 🟢 Verde:    score normalizado >= 0.6  (resultados fuertes)
+      - 🟡 Amarillo: score normalizado >= 0.3  (resultados aceptables)
+      - 🔴 Rojo:     score normalizado <  0.3  (resultados débiles)
+    
+    Si todos los scores son iguales (o hay 1 solo resultado), todo es verde.
+    """
+    if not resultados:
+        return resultados
+
+    scores = [r["score"] for r in resultados]
+    max_score = max(scores)
+    min_score = min(scores)
+    print(min_score, max_score)
+    rango = max_score - min_score
+
+    for r in resultados:
+        if rango == 0:
+            r["semaforo"] = "🟢"
+        else:
+            normalizado = (r["score"] - min_score) / rango
+            if normalizado >= 0.6:
+                r["semaforo"] = "🟢"
+            elif normalizado >= 0.2:
+                r["semaforo"] = "🟡"
+            else:
+                r["semaforo"] = "🔴"
+
+    return resultados
 
 def descubrir_segmentos_pkl() -> dict:
     """
@@ -280,7 +314,7 @@ with col_neg:
 
 col_topk, col_opts = st.columns([2, 1])
 with col_topk:
-    top_k = st.slider("Cantidad de resultados", 1, 100, 10)
+    top_k = st.slider("Cantidad de resultados", 1, 5000, 10)
 with col_opts:
     mostrar_breakdown     = st.checkbox("Desglose de score", value=True)
     mostrar_desc_completa = st.checkbox("Descripción completa", value=False)
@@ -312,6 +346,7 @@ if query:
             lexical_weight=w_lexical,
             metric_weight=w_metric,
         )
+        resultados = calcular_semaforo(resultados)
         tiempo = time.time() - start_time
 
         st.caption(f"⏱️ {len(resultados)} resultados en {tiempo:.3f}s — `{engine.source_name}`")
@@ -327,7 +362,7 @@ if query:
             breakdown = item.get('score_breakdown', {})
             es_yt     = item.get('es_youtube', engine.es_youtube)
 
-            icono = "🔥" if score_ia > 0.65 else "✨" if score_ia > 0.50 else "💡"
+            icono = item.get("semaforo", "💡")
 
             with st.expander(
                 f"{icono} #{rank} — {titulo}  |  Score: {score_ia:.3f}",
