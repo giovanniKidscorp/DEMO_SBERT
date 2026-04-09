@@ -524,26 +524,24 @@ class RecommendationEngine:
         for c in conceptos:
             # Tokens en idioma original (ya con variantes via normalize_text)
             bm25_tokens.extend(normalize_text(c))
-            
-            if not self.es_youtube:
-                try:
-                    idiomas_target = ['en', 'es', 'pt']
-                    for lang in idiomas_target:
-                        try:
-                            traduccion = GoogleTranslator(source='auto', target=lang).translate(c)
-                            if traduccion and traduccion.lower() != c.lower():
-                                # normalize_text ya expande variantes
-                                bm25_tokens.extend(normalize_text(traduccion))
+            try:
+                idiomas_target = ['en', 'es', 'pt']
+                for lang in idiomas_target:
+                    try:
+                        traduccion = GoogleTranslator(source='auto', target=lang).translate(c)
+                        if traduccion and traduccion.lower() != c.lower():
+                             # normalize_text ya expande variantes
+                            bm25_tokens.extend(normalize_text(traduccion))
                                 
-                                # NUEVO: también agregar variantes del texto crudo traducido
-                                # Esto captura "make-up" → "makeup" directamente
-                                for variant in expand_token_variants(traduccion.lower().strip()):
-                                    if len(variant) > 2:
-                                        bm25_tokens.append(variant)
-                        except:
-                            continue
-                except ImportError:
-                    pass
+                            # NUEVO: también agregar variantes del texto crudo traducido
+                            # Esto captura "make-up" → "makeup" directamente
+                            for variant in expand_token_variants(traduccion.lower().strip()):
+                                if len(variant) > 2:
+                                    bm25_tokens.append(variant)
+                    except:
+                        continue
+            except ImportError:
+                pass
             
             # Compound token sin espacios
             if ' ' in c:

@@ -10,7 +10,7 @@ import os
 import glob
 import time
 from Classes.recommendation import RecommendationEngine
-
+from collections import Counter
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN
 # ─────────────────────────────────────────────────────────────────────────────
@@ -65,41 +65,48 @@ st.markdown("""
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
-def calcular_semaforo(resultados: list) -> list:
+def calcular_semaforo(resultados: list,
+                      umbral_verde=0.85, umbral_rojo=0.60,
+                      piso_verde=0.70, piso_amarillo=0.50) -> list:
     """
-    Asigna semáforo (verde/amarillo/rojo) relativo a cada búsqueda.
+    Asigna semáforo combinando ratio relativo + piso absoluto.
     
-    Lógica: normaliza los scores al rango [0, 1] dentro de la búsqueda,
-    luego asigna por percentil del ranking:
-      - 🟢 Verde:    score normalizado >= 0.6  (resultados fuertes)
-      - 🟡 Amarillo: score normalizado >= 0.3  (resultados aceptables)
-      - 🔴 Rojo:     score normalizado <  0.3  (resultados débiles)
+    Un resultado es verde solo si cumple AMBAS:
+      1. ratio >= umbral_verde  (>= 85% del mejor)
+      2. score >= piso_verde    (score absoluto >= 0.70)
     
-    Si todos los scores son iguales (o hay 1 solo resultado), todo es verde.
+    Amarillo si cumple AMBAS:
+      1. ratio >= umbral_rojo   (>= 60% del mejor)
+      2. score >= piso_amarillo (score absoluto >= 0.50)
+    
+    Rojo: todo lo demás.
+    
+    Esto evita que queries sin sentido (max bajo, scores apretados)
+    generen verdes falsos.
     """
     if not resultados:
         return resultados
 
-    scores = [r["score"] for r in resultados]
-    max_score = max(scores)
-    min_score = min(scores)
-    print(min_score, max_score)
-    rango = max_score - min_score
+    max_score = resultados[0]["score"]
+
+    if max_score == 0:
+        for r in resultados:
+            r["semaforo"] = "🟡"
+        return resultados
 
     for r in resultados:
-        if rango == 0:
+        score = r["score"]
+        ratio = score / max_score
+
+        if ratio >= umbral_verde and score >= piso_verde:
             r["semaforo"] = "🟢"
+        elif ratio >= umbral_rojo and score >= piso_amarillo:
+            r["semaforo"] = "🟡"
         else:
-            normalizado = (r["score"] - min_score) / rango
-            if normalizado >= 0.6:
-                r["semaforo"] = "🟢"
-            elif normalizado >= 0.2:
-                r["semaforo"] = "🟡"
-            else:
-                r["semaforo"] = "🔴"
+            r["semaforo"] = "🔴"
 
     return resultados
-
+    
 def descubrir_segmentos_pkl() -> dict:
     """
     Escanea CARPETA_PKL y retorna segmentos que tienen ambos PKLs.
@@ -337,16 +344,36 @@ if query:
                 filtros_dict['genero'] = filtro_genero
 
         start_time = time.time()
-        resultados = engine.search(
+        resultados_full = engine.search(
             query=query,
             negative_query=neg_query if neg_query else None,
-            top_k=top_k,
+            top_k=len(engine.df),  # todo el ranking
             filters=filtros_dict if filtros_dict else None,
             semantic_weight=w_semantic,
             lexical_weight=w_lexical,
             metric_weight=w_metric,
         )
-        resultados = calcular_semaforo(resultados)
+
+        # Semáforo sobre el ranking completo
+        resultados_full = calcular_semaforo(resultados_full)
+
+        conteo = Counter(r["semaforo"] for r in resultados_full)
+        # Scores por zona
+        verdes = [r["score"] for r in resultados_full if r["semaforo"] == "🟢"]
+        amarillos = [r["score"] for r in resultados_full if r["semaforo"] == "🟡"]
+        rojos = [r["score"] for r in resultados_full if r["semaforo"] == "🔴"]
+
+        st.caption(
+            f"🟢 {conteo.get('🟢', 0)} ({max(verdes):.3f})  ·  "
+            f"🟡 {conteo.get('🟡', 0)} ({max(amarillos):.3f})  ·  "
+            f"🔴 {conteo.get('🔴', 0)} ({max(rojos):.3f})"
+            if verdes and amarillos else
+            f"🟢 {conteo.get('🟢', 0)}  ·  "
+            f"🟡 {conteo.get('🟡', 0)}  ·  "
+            f"🔴 {conteo.get('🔴', 0)}"
+        )
+        # Mostrar solo los que el usuario pidió
+        resultados = resultados_full[:top_k]
         tiempo = time.time() - start_time
 
         st.caption(f"⏱️ {len(resultados)} resultados en {tiempo:.3f}s — `{engine.source_name}`")
