@@ -4,7 +4,7 @@ UI unificada para Apps (Play Store) y YouTube.
 - Apps: carga desde Postgres o PKL local
 - YouTube: carga desde PKL local
 """
-
+import json
 import streamlit as st
 import os
 import glob
@@ -372,6 +372,36 @@ if query:
             f"🟡 {conteo.get('🟡', 0)}  ·  "
             f"🔴 {conteo.get('🔴', 0)}"
         )
+
+        # Filtrar verdes y amarillos del ranking completo
+        exportables = [
+            r for r in resultados_full
+            if r["semaforo"] in ("🟢", "🟡")
+        ][:5000]
+
+        if exportables:
+            export_data = []
+            for r in exportables:
+                meta = r["metadata"]
+                if engine.es_youtube:
+                    item_id = meta.get("appid") or meta.get("id") or ""
+                else:
+                    item_id = meta.get("id") or meta.get("app_id") or ""
+
+                export_data.append({
+                    "titulo": r["titulo"],
+                    "id": item_id
+                })
+
+            json_str = json.dumps(export_data, ensure_ascii=False, indent=2)
+
+            st.download_button(
+                label=f"⬇️ Descargar {len(export_data)} resultados (🟢+🟡)",
+                data=json_str,
+                file_name=f"{query.replace(' ', '_')}_{engine.source_name}.json",
+                mime="application/json",
+            )
+
         # Mostrar solo los que el usuario pidió
         resultados = resultados_full[:top_k]
         tiempo = time.time() - start_time

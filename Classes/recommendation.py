@@ -520,37 +520,75 @@ class RecommendationEngine:
         semantic_hits  = util.semantic_search(query_vec, self.embeddings, top_k=candidate_size)
 
         # ── 2. SCORE LÉXICO (BM25) ────────────────────────────────────────────
-        bm25_tokens = []
+        # Estrategia: correr BM25 por cada grupo de tokens (concepto + traducciones),
+        # normalizar cada grupo a [0,1], y tomar el máximo por documento.
+        # Esto evita que el IDF de términos raros (ej: "aprender" en corpus inglés)
+        # distorsione el ranking.
+
+        n_docs = len(self.df)
+
+        # Armar grupos de tokens: cada concepto original + sus traducciones = 1 grupo
+        token_groups = []
         for c in conceptos:
-            # Tokens en idioma original (ya con variantes via normalize_text)
-            bm25_tokens.extend(normalize_text(c))
+            group_tokens = list(normalize_text(c))
+
+            # Traducciones
             try:
-                idiomas_target = ['en', 'es', 'pt']
-                for lang in idiomas_target:
+                for lang in ['en', 'es', 'pt']:
                     try:
                         traduccion = GoogleTranslator(source='auto', target=lang).translate(c)
                         if traduccion and traduccion.lower() != c.lower():
-                             # normalize_text ya expande variantes
-                            bm25_tokens.extend(normalize_text(traduccion))
-                                
-                            # NUEVO: también agregar variantes del texto crudo traducido
-                            # Esto captura "make-up" → "makeup" directamente
+                            group_tokens.extend(normalize_text(traduccion))
                             for variant in expand_token_variants(traduccion.lower().strip()):
                                 if len(variant) > 2:
-                                    bm25_tokens.append(variant)
+                                    group_tokens.append(variant)
                     except:
                         continue
             except ImportError:
                 pass
-            
-            # Compound token sin espacios
+
+            # Compound token
             if ' ' in c:
-                bm25_tokens.append(c.replace(' ', '').lower())
-                bm25_tokens.append(c.replace(' ', '-').lower())  # NUEVO
+                group_tokens.append(c.replace(' ', '').lower())
+                group_tokens.append(c.replace(' ', '-').lower())
 
-        tokenized_query = list(dict.fromkeys(bm25_tokens))  # dedup preservando orden
-        bm25_scores = self.bm25.get_scores(tokenized_query)
+            # Dedup dentro del grupo
+            group_tokens = list(dict.fromkeys(group_tokens))
+            if group_tokens:
+                token_groups.append(group_tokens)
 
+        # Correr BM25 por cada grupo de tokens, normalizar, y acumular máximos
+        bm25_max_scores = np.zeros(n_docs)
+
+        for group in token_groups:
+            # Correr cada token del grupo por separado y tomar el max
+            # Esto evita que la suma de IDFs dentro del grupo también distorsione
+            group_max = np.zeros(n_docs)
+            for token in group:
+                token_scores = self.bm25.get_scores([token])
+                max_token = token_scores.max()
+                if max_token > 0:
+                    normalized = token_scores / max_token
+                else:
+                    normalized = token_scores
+                group_max = np.maximum(group_max, normalized)
+
+            # Acumular: si hay múltiples conceptos (separados por coma),
+            # promediar los máximos de cada grupo
+            bm25_max_scores = bm25_max_scores + group_max
+
+        # Promediar por cantidad de grupos si hay más de uno
+        if len(token_groups) > 1:
+            bm25_max_scores = bm25_max_scores / len(token_groups)
+
+        # Normalizar resultado final a [0, 1]
+        max_final = bm25_max_scores.max()
+        if max_final > 0:
+            bm25_scores = bm25_max_scores / max_final
+        else:
+            bm25_scores = bm25_max_scores
+
+        # ── Penalización de negativos en BM25 ─────────────────────────────────
         negative_keywords = set()
         if negative_query:
             neg_tokens = []
@@ -562,7 +600,7 @@ class RecommendationEngine:
 
             if bm25_negative_penalty > 0:
                 for idx in range(len(bm25_scores)):
-                    if idx >= len(self.df):
+                    if idx >= n_docs:
                         continue
                     row   = self.df.iloc[idx]
                     texto = str(row.get('channel_title', '') or row.get('common_title', '')) + \
@@ -570,7 +608,7 @@ class RecommendationEngine:
                     if any(kw in texto.lower() for kw in negative_keywords):
                         bm25_scores[idx] *= (1 - bm25_negative_penalty)
 
-        max_bm25 = max(bm25_scores) if max(bm25_scores) > 0 else 1.0
+        # NOTA: bm25_scores ya está normalizado a [0,1], no hace falta dividir por max_bm25 después
 
 
         # ── 3. FUSIÓN ─────────────────────────────────────────────────────────
@@ -584,7 +622,7 @@ class RecommendationEngine:
         for idx, bm25_score in enumerate(bm25_scores):
             if idx >= len(self.df):
                 continue
-            normalized_bm25 = bm25_score / max_bm25
+            normalized_bm25 = bm25_score
             if idx in score_components:
                 score_components[idx]["lexical"] = normalized_bm25
             else:
